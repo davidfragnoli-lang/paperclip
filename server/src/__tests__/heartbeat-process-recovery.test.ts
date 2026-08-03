@@ -100,6 +100,7 @@ vi.mock("../adapters/index.ts", async () => {
 import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+  forgetActiveRunExecutionForTests,
   heartbeatService,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
@@ -111,6 +112,7 @@ import {
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
 import { resolveLocalRunLogPath } from "../services/run-log-store.ts";
+import { environmentRuntimeService } from "../services/environment-runtime.ts";
 import { secretService } from "../services/secrets.ts";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
@@ -2177,27 +2179,66 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(lease?.releasedAt).toBeTruthy();
   });
 
-  it("does not reap lease-less local runs with no process metadata after the orphan-silence threshold", async () => {
+  it("reaps a lease-less no-log local run after the real queued-to-running transition", async () => {
     const now = new Date("2026-03-19T00:20:00.000Z");
     const staleAt = new Date("2026-03-19T00:00:00.000Z");
-    const { agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({
+    let rejectEnvironmentAcquisition: ((error: Error) => void) | null = null;
+    let resolveEnvironmentAcquisitionStarted: (() => void) | null = null;
+    const environmentAcquisitionStarted = new Promise<void>((resolve) => {
+      resolveEnvironmentAcquisitionStarted = resolve;
+    });
+    const testEnvironmentRuntime = environmentRuntimeService(db);
+    testEnvironmentRuntime.acquireRunLease = vi.fn(() => new Promise((_, reject) => {
+      rejectEnvironmentAcquisition = reject;
+      resolveEnvironmentAcquisitionStarted?.();
+    }));
+    const { agentId, runId, issueId, wakeupRequestId } = await seedQueuedIssueRunFixture({
       adapterType: "claude_local",
-      agentStatus: "idle",
+    });
+    const heartbeat = heartbeatService(db, { environmentRuntime: testEnvironmentRuntime });
+
+    await heartbeat.resumeQueuedRuns();
+    await Promise.race([
+      environmentAcquisitionStarted,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("Timed out waiting for environment acquisition")), 3_000);
+      }),
+    ]);
+
+    const transitionedRun = await heartbeat.getRun(runId);
+    expect(transitionedRun).toMatchObject({
+      status: "running",
       processPid: null,
       processGroupId: null,
-      now: staleAt,
-      updatedAt: staleAt,
-      createdAt: staleAt,
+      logStore: null,
+      logRef: null,
     });
-    const heartbeat = heartbeatService(db);
+    const leases = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.heartbeatRunId, runId));
+    expect(leases).toHaveLength(0);
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        startedAt: staleAt,
+        updatedAt: staleAt,
+        lastOutputAt: null,
+        logStore: null,
+        logRef: null,
+        logBytes: 0,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    forgetActiveRunExecutionForTests(runId);
 
     const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 1, now });
-    expect(result).toEqual({ reaped: 0, runIds: [] });
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
 
-    const activeRun = await heartbeat.getRun(runId);
-    expect(activeRun).toMatchObject({
-      status: "running",
-      errorCode: null,
+    const failedRun = await heartbeat.getRun(runId);
+    expect(failedRun).toMatchObject({
+      status: "failed",
+      errorCode: "process_lost",
       processPid: null,
       processGroupId: null,
     });
@@ -2213,14 +2254,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
-    expect(wakeup?.status).toBe("claimed");
+    expect(wakeup?.status).toBe("failed");
 
     const issue = await db
       .select()
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(runId);
+    expect(issue?.executionRunId).toBeNull();
+
+    if (!rejectEnvironmentAcquisition) {
+      throw new Error("Environment acquisition rejection handle was not captured");
+    }
+    rejectEnvironmentAcquisition(new Error("Simulated server loss during environment acquisition"));
+    await heartbeat.drainActiveRunExecutions();
   });
 
   it("reaps only stale-log zero-process runs in one cycle, including an active-lease corpse", async () => {
@@ -2284,7 +2331,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     try {
       const heartbeat = heartbeatService(db);
       const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 1, now });
-      expect(result).toEqual({ reaped: 1, runIds: [staleRun.runId] });
+      expect(result).toEqual({
+        reaped: 2,
+        runIds: expect.arrayContaining([staleRun.runId, missingLogRun.runId]),
+      });
 
       const staleFailedRun = await heartbeat.getRun(staleRun.runId);
       expect(staleFailedRun).toMatchObject({
@@ -2298,10 +2348,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         errorCode: null,
       });
 
-      const missingLogStillRunning = await heartbeat.getRun(missingLogRun.runId);
-      expect(missingLogStillRunning).toMatchObject({
-        status: "running",
-        errorCode: null,
+      const missingLogFailedRun = await heartbeat.getRun(missingLogRun.runId);
+      expect(missingLogFailedRun).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
         logStore: null,
         logRef: null,
       });
