@@ -1428,8 +1428,9 @@ export async function discoverProjectWorkspaceSkillDirectories(
     relativePath: string;
     inventoryMode: LocalSkillInventoryMode;
   }>();
-  const workspaceRoot = await fs.realpath(path.resolve(target.workspaceCwd)).catch(() => null);
-  if (!workspaceRoot) return [];
+  const workspaceRoot = path.resolve(target.workspaceCwd);
+  const canonicalWorkspaceRoot = await fs.realpath(workspaceRoot).catch(() => null);
+  if (!canonicalWorkspaceRoot) return [];
   const rootSkillPath = path.join(workspaceRoot, "SKILL.md");
   if ((await statPath(rootSkillPath))?.isFile()) {
     discovered.set(workspaceRoot, {
@@ -1445,9 +1446,10 @@ export async function discoverProjectWorkspaceSkillDirectories(
       : explicitPath.toLowerCase() === "skill.md"
         ? "."
         : explicitPath;
-    const absoluteSkillDir = await fs.realpath(path.resolve(workspaceRoot, relativeSkillDir)).catch(() => null);
-    if (!absoluteSkillDir) continue;
-    const relativeToWorkspace = path.relative(workspaceRoot, absoluteSkillDir);
+    const absoluteSkillDir = path.resolve(workspaceRoot, relativeSkillDir);
+    const canonicalSkillDir = await fs.realpath(absoluteSkillDir).catch(() => null);
+    if (!canonicalSkillDir) continue;
+    const relativeToWorkspace = path.relative(canonicalWorkspaceRoot, canonicalSkillDir);
     if (
       relativeToWorkspace === ".."
       || relativeToWorkspace.startsWith(`..${path.sep}`)
