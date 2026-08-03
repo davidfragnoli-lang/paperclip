@@ -82,7 +82,7 @@ import {
 export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
-import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
+import { getRunLogStore, resolveLocalRunLogPath, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
@@ -346,6 +346,7 @@ const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+const ORPHANED_RUN_SILENCE_SWEEP_THRESHOLD_MS = 15 * 60 * 1000;
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -6268,6 +6269,23 @@ function orphanedRunSilenceAgeMs(
   now: Date,
 ) {
   return Math.max(0, now.getTime() - orphanedRunDurableActivityAt(run).getTime());
+}
+
+type ZeroProcessRunLogActivity = "fresh" | "stale" | "missing" | "unknown";
+
+async function classifyZeroProcessRunLogActivity(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "logStore" | "logRef">,
+  now: Date,
+  staleThresholdMs: number,
+): Promise<ZeroProcessRunLogActivity> {
+  if (run.logStore !== "local_file" || !run.logRef) return "missing";
+  try {
+    const stats = await fs.stat(resolveLocalRunLogPath(run.logRef));
+    return now.getTime() - stats.mtimeMs < staleThresholdMs ? "fresh" : "stale";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return "missing";
+    return "unknown";
+  }
 }
 
 function readHotRestartAdoptionMetadata(resultJson: Record<string, unknown> | null | undefined) {
@@ -13331,6 +13349,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; now?: Date }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = opts?.now ?? new Date();
+    const orphanSilenceSweepThresholdMs = Math.max(
+      ORPHANED_RUN_SILENCE_SWEEP_THRESHOLD_MS,
+      staleThresholdMs,
+    );
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
       .select({
@@ -13395,11 +13417,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const hasActiveEnvironmentLease = activeLeaseRunIds.has(run.id);
       const silenceAgeMs = orphanedRunSilenceAgeMs(run, now);
       if (zeroProcessMetadata) {
-        logger.warn(
-          { runId: run.id, adapterType, agentStatus, silenceAgeMs, hasActiveEnvironmentLease },
-          "skipping orphan reap because local run has no process metadata and cannot be classified from silence alone",
+        const runLogActivity = await classifyZeroProcessRunLogActivity(
+          run,
+          now,
+          orphanSilenceSweepThresholdMs,
         );
-        continue;
+        if (
+          silenceAgeMs < orphanSilenceSweepThresholdMs ||
+          runLogActivity !== "stale"
+        ) {
+          logger.warn(
+            {
+              runId: run.id,
+              adapterType,
+              agentStatus,
+              silenceAgeMs,
+              orphanSilenceSweepThresholdMs,
+              hasActiveEnvironmentLease,
+              runLogActivity,
+            },
+            "skipping orphan reap because zero-process local run still has a positive or inconclusive liveness signal",
+          );
+          continue;
+        }
+        logger.warn(
+          {
+            runId: run.id,
+            adapterType,
+            agentStatus,
+            silenceAgeMs,
+            orphanSilenceSweepThresholdMs,
+            hasActiveEnvironmentLease,
+            runLogActivity,
+          },
+          "reaping zero-process local run after its durable activity and run log both exceeded the orphan threshold",
+        );
       }
       const processPidAlive = Boolean(
         tracksLocalChild && run.processPid && isProcessAlive(run.processPid),
