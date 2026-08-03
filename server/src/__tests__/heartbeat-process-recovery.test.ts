@@ -110,6 +110,7 @@ import {
   resolveHotRestartReportPath,
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
+import { resolveLocalRunLogPath } from "../services/run-log-store.ts";
 import { secretService } from "../services/secrets.ts";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
@@ -470,13 +471,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runErrorCode?: string | null;
     runError?: string | null;
     contextSnapshot?: Record<string, unknown>;
+    now?: Date;
+    updatedAt?: Date;
+    lastOutputAt?: Date | null;
+    createdAt?: Date;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
     const wakeupRequestId = randomUUID();
     const issueId = randomUUID();
-    const now = new Date("2026-03-19T00:00:00.000Z");
+    const now = input?.now ?? new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     await db.insert(companies).values({
@@ -529,7 +534,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
       startedAt: now,
-      updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+      lastOutputAt: input?.lastOutputAt ?? null,
+      createdAt: input?.createdAt ?? now,
+      updatedAt: input?.updatedAt ?? now,
     });
 
     if (input?.includeIssue !== false) {
@@ -557,19 +564,26 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     issueId: string;
     provider?: string;
   }) {
-    const environmentId = randomUUID();
+    const existingEnvironment = await db
+      .select({ id: environments.id })
+      .from(environments)
+      .where(eq(environments.driver, "local"))
+      .then((rows) => rows[0] ?? null);
+    const environmentId = existingEnvironment?.id ?? randomUUID();
     const leaseId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
 
-    await db.insert(environments).values({
-      id: environmentId,
-      companyId: input.companyId,
-      name: "Local test environment",
-      driver: "local",
-      status: "active",
-      config: {},
-      metadata: null,
-    });
+    if (!existingEnvironment) {
+      await db.insert(environments).values({
+        id: environmentId,
+        companyId: input.companyId,
+        name: "Local test environment",
+        driver: "local",
+        status: "active",
+        config: {},
+        metadata: null,
+      });
+    }
 
     await db.insert(environmentLeases).values({
       id: leaseId,
@@ -591,6 +605,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     return { environmentId, leaseId };
+  }
+
+  async function attachRunLogFixture(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    writtenAt: Date;
+  }) {
+    const logRef = `${input.companyId}/${input.agentId}/${input.runId}.ndjson`;
+    const logPath = resolveLocalRunLogPath(logRef);
+    const content = `${JSON.stringify({
+      ts: input.writtenAt.toISOString(),
+      stream: "stdout",
+      chunk: "test output",
+    })}\n`;
+    await fs.mkdir(path.dirname(logPath), { recursive: true });
+    await fs.writeFile(logPath, content, "utf8");
+    await fs.utimes(logPath, input.writtenAt, input.writtenAt);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        logStore: "local_file",
+        logRef,
+        logBytes: Buffer.byteLength(content, "utf8"),
+      })
+      .where(eq(heartbeatRuns.id, input.runId));
   }
 
   it("does not reap active adapter executions started by another heartbeat service instance", async () => {
@@ -2183,39 +2223,104 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBe(runId);
   });
 
-  it("does not reap stale active-lease local runs with no process metadata after the orphan-silence threshold", async () => {
+  it("reaps only stale-log zero-process runs in one cycle, including an active-lease corpse", async () => {
     const now = new Date("2026-03-19T00:20:00.000Z");
     const staleAt = new Date("2026-03-19T00:00:00.000Z");
-    const { runId, issueId, companyId } = await seedRunFixture({
+    const freshAt = new Date("2026-03-19T00:19:00.000Z");
+    const runLogBasePath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-log-reap-"));
+    const previousRunLogBasePath = process.env.RUN_LOG_BASE_PATH;
+    process.env.RUN_LOG_BASE_PATH = runLogBasePath;
+
+    const staleRun = await seedRunFixture({
       adapterType: "claude_local",
       agentStatus: "idle",
       processPid: null,
       processGroupId: null,
       now: staleAt,
       updatedAt: staleAt,
+      lastOutputAt: staleAt,
       createdAt: staleAt,
     });
-    const { leaseId } = await seedEnvironmentLeaseFixture({
-      companyId,
-      runId,
-      issueId,
+    await attachRunLogFixture({
+      companyId: staleRun.companyId,
+      agentId: staleRun.agentId,
+      runId: staleRun.runId,
+      writtenAt: staleAt,
     });
-    const heartbeat = heartbeatService(db);
+    const { leaseId } = await seedEnvironmentLeaseFixture({
+      companyId: staleRun.companyId,
+      runId: staleRun.runId,
+      issueId: staleRun.issueId,
+    });
 
-    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 1, now });
-    expect(result).toEqual({ reaped: 0, runIds: [] });
+    const freshRun = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      now: staleAt,
+      updatedAt: staleAt,
+      lastOutputAt: staleAt,
+      createdAt: staleAt,
+    });
+    await attachRunLogFixture({
+      companyId: freshRun.companyId,
+      agentId: freshRun.agentId,
+      runId: freshRun.runId,
+      writtenAt: freshAt,
+    });
 
-    const activeRun = await heartbeat.getRun(runId);
-    expect(activeRun?.status).toBe("running");
-    expect(activeRun?.errorCode).toBeNull();
+    const missingLogRun = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      now: staleAt,
+      updatedAt: staleAt,
+      lastOutputAt: staleAt,
+      createdAt: staleAt,
+    });
 
-    const lease = await db
-      .select()
-      .from(environmentLeases)
-      .where(eq(environmentLeases.id, leaseId))
-      .then((rows) => rows[0] ?? null);
-    expect(lease?.status).toBe("active");
-    expect(lease?.releasedAt).toBeNull();
+    try {
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 1, now });
+      expect(result).toEqual({ reaped: 1, runIds: [staleRun.runId] });
+
+      const staleFailedRun = await heartbeat.getRun(staleRun.runId);
+      expect(staleFailedRun).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+      });
+
+      const freshStillRunning = await heartbeat.getRun(freshRun.runId);
+      expect(freshStillRunning).toMatchObject({
+        status: "running",
+        errorCode: null,
+      });
+
+      const missingLogStillRunning = await heartbeat.getRun(missingLogRun.runId);
+      expect(missingLogStillRunning).toMatchObject({
+        status: "running",
+        errorCode: null,
+        logStore: null,
+        logRef: null,
+      });
+
+      const lease = await db
+        .select()
+        .from(environmentLeases)
+        .where(eq(environmentLeases.id, leaseId))
+        .then((rows) => rows[0] ?? null);
+      expect(lease?.status).toBe("failed");
+      expect(lease?.releasedAt).toBeTruthy();
+    } finally {
+      if (previousRunLogBasePath === undefined) {
+        delete process.env.RUN_LOG_BASE_PATH;
+      } else {
+        process.env.RUN_LOG_BASE_PATH = previousRunLogBasePath;
+      }
+      await fs.rm(runLogBasePath, { recursive: true, force: true });
+    }
   });
 
   it("keeps recent active-lease local runs with no process metadata protected until the orphan-silence threshold", async () => {
