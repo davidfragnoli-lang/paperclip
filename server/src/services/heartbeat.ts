@@ -601,6 +601,10 @@ const activeRunExecutionPromises = new Set<Promise<void>>();
 const activeWakeupPromises = new Set<Promise<unknown>>();
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
+export function forgetActiveRunExecutionForTests(runId: string) {
+  activeRunExecutions.delete(runId);
+}
+
 type RuntimeConfigSecretResolver = Pick<
   ReturnType<typeof secretService>,
   | "resolveAdapterConfigForRuntime"
@@ -12954,9 +12958,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           now,
           orphanSilenceSweepThresholdMs,
         );
+        const hasPositiveOrInconclusiveLivenessSignal =
+          runLogActivity === "fresh" ||
+          runLogActivity === "unknown" ||
+          (runLogActivity === "missing" && (
+            hasActiveEnvironmentLease ||
+            isResolvedInteractionContinuationWakeContext(run.contextSnapshot)
+          ));
         if (
           silenceAgeMs < orphanSilenceSweepThresholdMs ||
-          runLogActivity !== "stale"
+          hasPositiveOrInconclusiveLivenessSignal
         ) {
           logger.warn(
             {
