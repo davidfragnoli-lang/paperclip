@@ -36,6 +36,8 @@ export type {
   DecisionChosenOptionCount,
   DecisionRuleKeyStats,
   DecisionStatsResponse,
+  AttentionArchiveManifestEntry,
+  AttentionArchiveTargetSnapshot,
 } from "./types/decision.js";
 
 export {
@@ -121,12 +123,18 @@ export {
   createDecisionQueueSchema,
   updateDecisionQueueSchema,
   addDecisionQueueItemSchema,
+  removeDecisionQueueItemSchema,
   decisionTriageDecideBySchema,
   updateDecisionTriageSchema,
+  updateDecisionRetentionSchema,
+  createDecisionArchiveProposalSchema,
   type CreateDecisionQueueInput,
   type UpdateDecisionQueueInput,
   type AddDecisionQueueItemInput,
+  type RemoveDecisionQueueItemInput,
   type UpdateDecisionTriageInput,
+  type UpdateDecisionRetentionInput,
+  type CreateDecisionArchiveProposalInput,
 } from "./validators/decision-queue.js";
 export type {
   DecisionTrainingExample,
@@ -674,6 +682,9 @@ export type {
   CompanySkillImportRequest,
   CompanySkillImportResult,
   CompanySkillProjectScanRequest,
+  CompanySkillProjectBrowseRequest,
+  CompanySkillProjectBrowseEntry,
+  CompanySkillProjectBrowseResult,
   CompanySkillProjectScanCandidateStatus,
   CompanySkillProjectScanCandidate,
   CompanySkillProjectScanSkipped,
@@ -2037,6 +2048,9 @@ export {
   companySkillAuditResultSchema,
   companySkillImportSchema,
   companySkillProjectScanRequestSchema,
+  companySkillProjectBrowseRequestSchema,
+  companySkillProjectBrowseEntrySchema,
+  companySkillProjectBrowseResultSchema,
   companySkillProjectScanSkippedSchema,
   companySkillProjectScanConflictSchema,
   companySkillProjectScanResultSchema,

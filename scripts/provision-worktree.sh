@@ -8,7 +8,10 @@ paperclip_instance_id="${PAPERCLIP_INSTANCE_ID:-default}"
 paperclip_dir="$worktree_cwd/.paperclip"
 worktree_config_path="$paperclip_dir/config.json"
 worktree_env_path="$paperclip_dir/.env"
+seed_pending_marker_path="$paperclip_dir/seed-pending"
+seed_complete_marker_path="$paperclip_dir/seed-complete"
 worktree_name="${PAPERCLIP_WORKSPACE_BRANCH:-$(basename "$worktree_cwd")}"
+created_worktree_config=0
 worktree_instance_id="$(WORKTREE_CWD="$worktree_cwd" node <<'EOF'
 const crypto = require("node:crypto");
 const path = require("node:path");
@@ -58,16 +61,6 @@ else
   # config is not.
   init_args+=(--no-seed)
 fi
-init_args=(worktree init --force --name "$worktree_name")
-if [[ -f "$source_config_path" ]]; then
-  init_args+=(--seed-mode minimal --from-config "$source_config_path")
-else
-  # A fresh/test repository may not have a source instance yet. Initializing
-  # without a database seed is safe; pointing at the operator's default live
-  # config is not.
-  init_args+=(--no-seed)
-fi
-
 base_cli_files_present() {
   [[ -f "$base_cli_runner_path" && -f "$base_cli_entry_path" ]]
 }
@@ -249,6 +242,31 @@ for (const rawValue of runtimePaths) {
     fail(`existing worktree config path is outside ${instanceRoot}: ${resolved}`);
   }
 }
+EOF
+}
+
+write_seed_pending_marker() {
+  SEED_PENDING_MARKER_PATH="$seed_pending_marker_path" \
+  SEED_COMPLETE_MARKER_PATH="$seed_complete_marker_path" \
+  SOURCE_CONFIG_PATH="$source_config_path" \
+  node <<'EOF'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const pendingPath = process.env.SEED_PENDING_MARKER_PATH;
+const completePath = process.env.SEED_COMPLETE_MARKER_PATH;
+fs.rmSync(completePath, { force: true });
+fs.writeFileSync(
+  pendingPath,
+  `${JSON.stringify({
+    version: 1,
+    state: "pending",
+    sourceConfigPath: path.resolve(process.env.SOURCE_CONFIG_PATH),
+    seedMode: "minimal",
+    createdAt: new Date().toISOString(),
+  }, null, 2)}\n`,
+  { mode: 0o600 },
+);
 EOF
 }
 
@@ -538,6 +556,11 @@ else
     echo "paperclipai worktree init unavailable; writing isolated fallback config without DB seeding." >&2
     write_fallback_worktree_config
   fi
+  created_worktree_config=1
+fi
+
+if [[ "$created_worktree_config" -eq 1 && ! -e "$seed_pending_marker_path" && ! -e "$seed_complete_marker_path" ]]; then
+  write_seed_pending_marker
 fi
 
 list_base_node_modules_paths() {
