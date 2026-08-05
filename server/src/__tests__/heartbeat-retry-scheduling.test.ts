@@ -14,6 +14,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
   issues,
   projects,
@@ -130,6 +131,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   async function cleanupRetryFixtureOnce() {
     await db.delete(activityLog);
     await db.delete(environmentLeases);
+    await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(executionWorkspaces);

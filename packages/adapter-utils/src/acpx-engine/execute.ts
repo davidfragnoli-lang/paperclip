@@ -2868,8 +2868,6 @@ function warmHandleMatches(
   return entry !== undefined && entry.runtime === runtime && entry.handle === handle;
 }
 
-/** The stable name of the one root span for a sandbox bring-up. It is a fixed
- * low-cardinality constant, never derived from run/user data. */
 const STARTUP_ROOT_SPAN_NAME = "sandbox.startup";
 
 /** The shared batch tag for the two parallel bridge steps. It is a fixed
@@ -2932,7 +2930,7 @@ function openStartupRootSpan(
         if (failed) span.setStatus({ code: 2 });
         span.end();
       } catch {
-        // Observability must not change startup control flow.
+        // Startup telemetry must never change runtime control flow.
       }
     },
   };

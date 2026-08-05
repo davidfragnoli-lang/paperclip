@@ -1015,6 +1015,7 @@ export const requestConfirmationResultSchema = z.object({
     "issue_closed",
     "addressee_deleted",
   ]),
+  targetMutationApplied: z.literal(false).optional(),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   supersededByInteractionId: z.string().uuid().nullable().optional(),
