@@ -18191,6 +18191,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (activeExecutionRun) {
+          const foldDuplicateLiveWake = async () => {
+            if (!opts.idempotencyKey) return false;
+            const folded = await tx
+              .update(agentWakeupRequests)
+              .set({
+                coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, agent.companyId),
+                  eq(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+                  inArray(agentWakeupRequests.status, [
+                    "queued",
+                    "claimed",
+                    "completed",
+                    "deferred_issue_execution",
+                  ]),
+                ),
+              )
+              .returning({ id: agentWakeupRequests.id })
+              .then((rows) => rows[0] ?? null);
+            return Boolean(folded);
+          };
           const executionAgent = await tx
             .select({ name: agents.name })
             .from(agents)
@@ -18235,6 +18260,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .returning()
               .then((rows) => rows[0] ?? availableActiveExecutionRun);
 
+            if (await foldDuplicateLiveWake()) {
+              return { kind: "duplicate" as const };
+            }
             await tx.insert(agentWakeupRequests).values({
               companyId: agent.companyId,
               agentId,
