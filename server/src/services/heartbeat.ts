@@ -8341,15 +8341,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } catch (err) {
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
+          const rearmedPatch = rearmUndeliveredIssueMonitorPatch({
+            issue: claimed,
+            now: input.now,
+            nextCheckAt: scheduledAtIso,
+            deliveredAttemptCount: nextAttemptCount,
+          });
           await db
             .update(issues)
             .set({
-              ...buildIssueMonitorClearedPatch({
-                issue: claimed,
-                policy,
-                clearReason: "dispatch_skipped",
-                clearedAt: input.now,
-              }),
+              ...rearmedPatch,
               updatedAt: new Date(),
             })
             .where(eq(issues.id, claimed.id));
@@ -8366,7 +8367,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             details: {
               identifier: claimed.identifier,
               nextCheckAt: scheduledAtIso,
-              attemptCount: nextAttemptCount,
+              attemptedAttemptCount: nextAttemptCount,
+              restoredAttemptCount:
+                "monitorAttemptCount" in rearmedPatch ? rearmedPatch.monitorAttemptCount ?? null : null,
+              rearmedNextCheckAt:
+                "monitorNextCheckAt" in rearmedPatch && rearmedPatch.monitorNextCheckAt instanceof Date
+                  ? rearmedPatch.monitorNextCheckAt.toISOString()
+                  : null,
+              terminalAttemptConsumed: false,
               notes: claimed.monitorNotes ?? null,
               reason: err.message,
               source: input.activitySource,
