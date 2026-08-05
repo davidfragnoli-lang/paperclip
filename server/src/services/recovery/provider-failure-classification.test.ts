@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -58,6 +59,7 @@ const EXCLUDED_ERROR_CODE_SOURCE_FILES: ReadonlyMap<string, string> = new Map([
 const NON_ADAPTER_FAILURE_ERROR_CODE_EXCLUSIONS: ReadonlyMap<string, string> = new Map([
   ["agent_not_found", "Heartbeat dispatch could not resolve an agent; this is not an adapter failure."],
   ["agent_not_invokable", "Agent lifecycle policy prevented invocation; retry requires lifecycle state to change."],
+  ["agent_paused", "The agent was paused; board lifecycle owns the outcome."],
   ["budget_blocked", "Budget policy prevented invocation; retry requires budget state to change."],
   ["cancelled", "The adapter run was deliberately cancelled; cancellation lifecycle owns the outcome."],
   ["issue_assignee_changed", "Issue ownership changed during execution; board lifecycle owns the outcome."],
@@ -132,18 +134,40 @@ function extractEmittedErrorCodes(filePath: string) {
   const sourceText = fs.readFileSync(filePath, "utf8");
   const sourceFile = ts.createSourceFile(filePath, sourceText, ts.ScriptTarget.Latest, true);
   const variableInitializers = new Map<string, ts.Expression[]>();
+  const callableDeclarations = new Map<string, ts.FunctionLikeDeclaration[]>();
+  const callExpressions: ts.CallExpression[] = [];
   const errorCodeAssignments: ts.Expression[] = [];
+
+  const addInitializer = (name: string, initializer: ts.Expression) => {
+    const initializers = variableInitializers.get(name) ?? [];
+    initializers.push(initializer);
+    variableInitializers.set(name, initializers);
+  };
+
+  const addCallableDeclaration = (name: string, declaration: ts.FunctionLikeDeclaration) => {
+    const declarations = callableDeclarations.get(name) ?? [];
+    declarations.push(declaration);
+    callableDeclarations.set(name, declarations);
+  };
 
   const indexSource = (node: ts.Node) => {
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-      const initializers = variableInitializers.get(node.name.text) ?? [];
-      initializers.push(node.initializer);
-      variableInitializers.set(node.name.text, initializers);
+      addInitializer(node.name.text, node.initializer);
+      if (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer)) {
+        addCallableDeclaration(node.name.text, node.initializer);
+      }
     }
     if (ts.isPropertyDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-      const initializers = variableInitializers.get(node.name.text) ?? [];
-      initializers.push(node.initializer);
-      variableInitializers.set(node.name.text, initializers);
+      addInitializer(node.name.text, node.initializer);
+    }
+    if (ts.isParameter(node) && ts.isIdentifier(node.name) && node.initializer) {
+      addInitializer(node.name.text, node.initializer);
+    }
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      addCallableDeclaration(node.name.text, node);
+    }
+    if (ts.isCallExpression(node)) {
+      callExpressions.push(node);
     }
     if (
       ts.isPropertyAssignment(node) &&
@@ -152,9 +176,29 @@ function extractEmittedErrorCodes(filePath: string) {
     ) {
       errorCodeAssignments.push(node.initializer);
     }
+    if (ts.isShorthandPropertyAssignment(node) && node.name.text === "errorCode") {
+      errorCodeAssignments.push(node.name);
+    }
     ts.forEachChild(node, indexSource);
   };
   indexSource(sourceFile);
+
+  for (const callExpression of callExpressions) {
+    let calledExpression: ts.Expression = callExpression.expression;
+    while (ts.isParenthesizedExpression(calledExpression)) calledExpression = calledExpression.expression;
+    if (!ts.isIdentifier(calledExpression)) continue;
+    for (const declaration of callableDeclarations.get(calledExpression.text) ?? []) {
+      declaration.parameters.forEach((parameter, index) => {
+        if (
+          ts.isIdentifier(parameter.name) &&
+          parameter.name.text === "errorCode" &&
+          callExpression.arguments[index]
+        ) {
+          addInitializer(parameter.name.text, callExpression.arguments[index]);
+        }
+      });
+    }
+  }
 
   const codes = new Set<string>();
   const visited = new Set<ts.Expression>();
@@ -222,6 +266,35 @@ function extractEmittedErrorCodes(filePath: string) {
 }
 
 describe("classifyAdapterFailureForRecovery", () => {
+  it("extracts error codes sourced from parameter defaults and same-file call arguments", () => {
+    const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-error-code-extractor-"));
+    const fixturePath = path.join(fixtureDir, "fixture.ts");
+    fs.writeFileSync(
+      fixturePath,
+      `
+        function emit(errorCode = "default_parameter_code") {
+          return { errorCode };
+        }
+        const emitFromArrow = (errorCode = "arrow_default_code") => ({ errorCode });
+        emit("function_argument_code");
+        emitFromArrow("arrow_argument_code");
+      `,
+    );
+
+    try {
+      expect(extractEmittedErrorCodes(fixturePath).codes).toEqual(
+        new Set([
+          "default_parameter_code",
+          "function_argument_code",
+          "arrow_default_code",
+          "arrow_argument_code",
+        ]),
+      );
+    } finally {
+      fs.rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
   it("classifies usage-limit messages and parses the provider reset time", () => {
     const now = new Date("2026-07-15T20:00:00.000Z");
     const classification = classifyAdapterFailureForRecovery({
