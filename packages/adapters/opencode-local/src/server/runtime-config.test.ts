@@ -1,12 +1,19 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
+const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
+
+beforeEach(() => {
+  delete process.env.ANTHROPIC_API_KEY;
+});
 
 afterEach(async () => {
+  if (originalAnthropicApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+  else process.env.ANTHROPIC_API_KEY = originalAnthropicApiKey;
   await Promise.all(
     [...cleanupPaths].map(async (filepath) => {
       await fs.rm(filepath, { recursive: true, force: true });
