@@ -488,6 +488,8 @@ const TRANSIENT_INFRA_ADAPTER_FAILURE_ERROR_CODES: ReadonlySet<string> = new Set
 ]);
 
 export const INTENTIONALLY_UNCLASSIFIED_ADAPTER_FAILURE_ERROR_CODES: ReadonlySet<string> = new Set([
+  // The retired acpx adapter requires migration to a supported adapter, not automatic recovery.
+  "acpx_local_retired",
   "acpx_timeout",
   "acpx_auth_required",
   "acpx_backend_missing",
