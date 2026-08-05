@@ -947,10 +947,11 @@ export async function startServer(): Promise<StartedServer> {
     port: listenPort,
   });
   const inheritedApiUrl = process.env.PAPERCLIP_API_URL?.trim();
+  const publicApiUrl = normalizeUrlToOrigin(config.authPublicBaseUrl ?? undefined);
   const configuredApiUrl =
     inheritedApiUrl && shouldRewriteConfiguredApiUrlForRuntimePort(inheritedApiUrl, runtimeListenHost)
       ? normalizeUrlToOrigin(rewriteLocalUrlPort(inheritedApiUrl, listenPort)) ?? runtimeApiUrl
-      : inheritedApiUrl || runtimeApiUrl;
+      : inheritedApiUrl || publicApiUrl || runtimeApiUrl;
   const runtimeApiCandidates = buildRuntimeApiCandidateUrls({
     preferredApiUrl: configuredApiUrl,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,

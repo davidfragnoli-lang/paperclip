@@ -502,6 +502,9 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(prompt).toContain("PAPERCLIP_WAKE_PAYLOAD_JSON");
     expect(prompt).toContain("Paperclip API access note:");
     expect(prompt).toContain('PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"; PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"');
+    expect(prompt).toContain("Treat the request as successful only when it returns HTTP 200 with content-type application/json");
+    expect(prompt).toContain("an HTTP 200 text/html response is an access login page, not the API");
+    expect(prompt).toContain("curl -sS -D -");
     expect(prompt).toContain("$PAPERCLIP_API_BASE/api/agents/me");
     expect(prompt).toContain("$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID");
     expect(prompt).toContain("X-Paperclip-Run-Id");

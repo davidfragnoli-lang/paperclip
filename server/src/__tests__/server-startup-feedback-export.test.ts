@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { buildPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -823,17 +824,20 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     else process.env.PAPERCLIP_LISTEN_PORT = ORIGINAL_PAPERCLIP_LISTEN_PORT;
   });
 
-  it("uses the externally set PAPERCLIP_API_URL when provided", async () => {
-    process.env.PAPERCLIP_API_URL = "http://custom-api:3100";
+  it("keeps an external public URL separate from the agent-delivered runtime URL", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
 
     const started = await startServer();
+    const agentEnv = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
 
-    expect(started.apiUrl).toBe("http://custom-api:3100");
-    expect(process.env.PAPERCLIP_API_URL).toBe("http://custom-api:3100");
+    expect(started.apiUrl).toBe("https://paperclip.example.test");
+    expect(process.env.PAPERCLIP_API_URL).toBe("https://paperclip.example.test");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3210");
+    expect(agentEnv.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3210");
     expect(JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]")).toEqual(
-      expect.arrayContaining(["http://custom-api:3100"]),
+      expect.arrayContaining(["https://paperclip.example.test", "http://127.0.0.1:3210"]),
     );
-    expect(JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]")[0]).toBe("http://custom-api:3100");
+    expect(JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]")[0]).toBe("https://paperclip.example.test");
   });
 
   it("falls back to host-based URL when PAPERCLIP_API_URL is not set", async () => {
@@ -871,7 +875,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("http://my-host.ts.net:3110");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3110");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3110");
   });
 
   it("keeps no-port auth public URLs stable when detect-port selects a new port", async () => {
@@ -887,6 +891,9 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("https://paperclip.example");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("https://paperclip.example");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3110");
+    expect(JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]")).toEqual(
+      expect.arrayContaining(["https://paperclip.example", "http://127.0.0.1:3110"]),
+    );
   });
 });
