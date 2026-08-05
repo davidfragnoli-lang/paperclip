@@ -10,22 +10,122 @@ import {
   classifyAdapterFailureForRecovery,
 } from "./service.js";
 
-function discoverAdapterEntrypoints(rootDirs: string[]) {
-  const entrypoints: string[] = [];
+const NON_PRODUCTION_SOURCE_PATH_SEGMENTS = ["/__tests__/", ".test.ts", ".spec.ts"] as const;
+
+const EXCLUDED_ERROR_CODE_SOURCE_FILES: ReadonlyMap<string, string> = new Map([
+  [
+    "packages/adapters/codex-local/src/server/acp.ts",
+    "Copies auth-classifier outcomes; it does not define recovery codes.",
+  ],
+  ["packages/db/src/schema/heartbeat_runs.ts", "Declares the persisted errorCode column; it emits no value."],
+  ["packages/db/src/schema/secret_access_events.ts", "Declares the audit errorCode column; it emits no value."],
+  ["packages/db/src/schema/tool_access.ts", "Declares tool-access errorCode columns; it emits no value."],
+  ["packages/shared/src/validators/issue.ts", "Declares errorCode validators; it emits no value."],
+  [
+    "server/src/middleware/error-handler.ts",
+    "Reports exception names to telemetry, outside adapter-run recovery.",
+  ],
+  [
+    "server/src/routes/issues.ts",
+    "Emits operator-interrupt lifecycle outcomes, outside adapter-failure recovery.",
+  ],
+  ["server/src/services/activity.ts", "Projects stored run errorCode fields into activity views; it emits no value."],
+  ["server/src/services/attention.ts", "Projects stored run errorCode fields into attention views; it emits no value."],
+  ["server/src/services/external-objects.ts", "Emits external-object refresh outcomes, outside adapter-run recovery."],
+  ["server/src/services/feedback.ts", "Projects stored run errorCode fields into feedback exports; it emits no value."],
+  [
+    "server/src/services/github-external-object-provider.ts",
+    "Emits GitHub object-refresh outcomes, outside adapter-run recovery.",
+  ],
+  ["server/src/services/issues.ts", "Projects stored run errorCode fields into issue responses; it emits no value."],
+  [
+    "server/src/services/recovery/service.ts",
+    "Persists recovery metadata and existing run codes; it is a consumer, not a producer.",
+  ],
+  [
+    "server/src/services/responsible-user-denial-run-outcomes.ts",
+    "Copies caller-owned denial codes onto runs, outside adapter-failure recovery.",
+  ],
+  ["server/src/services/secrets.ts", "Emits secret-resolution outcomes, outside adapter-run recovery."],
+  [
+    "server/src/services/tool-access-policy.ts",
+    "Copies policy decision codes into tool-access records, outside adapter-run recovery.",
+  ],
+  ["server/src/services/tool-access.ts", "Persists tool-access and connection-token outcomes, outside adapter-run recovery."],
+  ["server/src/services/tool-gateway.ts", "Emits tool-gateway outcomes, outside adapter-run recovery."],
+]);
+
+const NON_ADAPTER_FAILURE_ERROR_CODE_EXCLUSIONS: ReadonlyMap<string, string> = new Map([
+  ["agent_not_found", "Heartbeat dispatch could not resolve an agent; this is not an adapter failure."],
+  ["agent_not_invokable", "Agent lifecycle policy prevented invocation; retry requires lifecycle state to change."],
+  ["budget_blocked", "Budget policy prevented invocation; retry requires budget state to change."],
+  ["cancelled", "The adapter run was deliberately cancelled; cancellation lifecycle owns the outcome."],
+  ["issue_assignee_changed", "Issue ownership changed during execution; board lifecycle owns the outcome."],
+  ["issue_cancelled", "The issue was cancelled; board lifecycle owns the outcome."],
+  [
+    "issue_continuation_waiting_on_review",
+    "The issue is deliberately waiting for review, not adapter recovery.",
+  ],
+  ["issue_dependencies_blocked", "Issue dependencies prevent execution; dependency lifecycle owns the outcome."],
+  [
+    "issue_execution_lock_changed",
+    "The issue execution lock changed; board concurrency control owns the outcome.",
+  ],
+  ["issue_not_found", "The issue disappeared before execution; board lifecycle owns the outcome."],
+  ["issue_not_in_progress", "The issue is no longer executable; board lifecycle owns the outcome."],
+  ["issue_paused", "The issue is paused; board lifecycle owns the outcome."],
+  ["issue_reassigned", "The issue was reassigned; board lifecycle owns the outcome."],
+  [
+    "issue_review_participant_changed",
+    "The review participant changed; review lifecycle owns the outcome.",
+  ],
+  ["issue_terminal_status", "The issue reached a terminal state; board lifecycle owns the outcome."],
+  [
+    "lock_released_on_reassignment",
+    "The execution lock was released after reassignment; board lifecycle owns the outcome.",
+  ],
+  ["process_detached", "The local process detached successfully; runtime lifecycle owns the outcome."],
+  ["server_shutdown_interrupted", "The server interrupted the run during shutdown; runtime lifecycle owns the outcome."],
+  ["workspace_busy", "Shared-workspace contention is a scheduled deferral, not an adapter failure."],
+]);
+
+function discoverPackageSourceRoots(packagesRoot: string) {
+  const sourceRoots: string[] = [];
+  const visit = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const entryPath = path.join(dir, entry.name);
+      if (entry.name === "src") {
+        sourceRoots.push(entryPath);
+      } else {
+        visit(entryPath);
+      }
+    }
+  };
+  visit(packagesRoot);
+  return sourceRoots.sort();
+}
+
+function discoverErrorCodeSourceFiles(rootDirs: string[]) {
+  const sourceFiles: string[] = [];
 
   const visit = (dir: string) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const entryPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         visit(entryPath);
-      } else if (entry.isFile() && entry.name === "execute.ts") {
-        entrypoints.push(entryPath);
+      } else if (
+        entry.isFile() &&
+        /\.[cm]?tsx?$/.test(entry.name) &&
+        !NON_PRODUCTION_SOURCE_PATH_SEGMENTS.some((segment) => entryPath.includes(segment))
+      ) {
+        sourceFiles.push(entryPath);
       }
     }
   };
 
   for (const rootDir of rootDirs) visit(rootDir);
-  return entrypoints.sort();
+  return [...new Set(sourceFiles)].sort();
 }
 
 function extractEmittedErrorCodes(filePath: string) {
@@ -36,6 +136,11 @@ function extractEmittedErrorCodes(filePath: string) {
 
   const indexSource = (node: ts.Node) => {
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const initializers = variableInitializers.get(node.name.text) ?? [];
+      initializers.push(node.initializer);
+      variableInitializers.set(node.name.text, initializers);
+    }
+    if (ts.isPropertyDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
       const initializers = variableInitializers.get(node.name.text) ?? [];
       initializers.push(node.initializer);
       variableInitializers.set(node.name.text, initializers);
@@ -85,6 +190,12 @@ function extractEmittedErrorCodes(filePath: string) {
     }
     if (ts.isIdentifier(expression)) {
       for (const initializer of variableInitializers.get(expression.text) ?? []) {
+        collectPossibleValues(initializer);
+      }
+      return;
+    }
+    if (ts.isPropertyAccessExpression(expression)) {
+      for (const initializer of variableInitializers.get(expression.name.text) ?? []) {
         collectPossibleValues(initializer);
       }
       return;
@@ -257,7 +368,6 @@ describe("classifyAdapterFailureForRecovery", () => {
     for (const errorCode of [
       "acpx_turn_failed",
       "acpx_session_init_failed",
-      "acpx_stream_idle_timeout",
       "paperclip_control_plane_unreachable",
       "process_lost",
     ]) {
@@ -271,14 +381,25 @@ describe("classifyAdapterFailureForRecovery", () => {
 
   it("source-derives emitted failure codes and requires classification or explicit exclusion", () => {
     const repoRoot = fileURLToPath(new URL("../../../../", import.meta.url));
-    const entrypoints = discoverAdapterEntrypoints([
-      path.join(repoRoot, "packages/adapters"),
-      path.join(repoRoot, "packages/adapter-utils/src"),
-      path.join(repoRoot, "server/src/adapters"),
+    const packageSourceRoots = discoverPackageSourceRoots(path.join(repoRoot, "packages"));
+    const sourceFiles = discoverErrorCodeSourceFiles([
+      path.join(repoRoot, "server/src"),
+      ...packageSourceRoots,
     ]);
-    const producerFiles = entrypoints.filter(
-      (filePath) => extractEmittedErrorCodes(filePath).errorCodeAssignmentCount > 0,
+    const discoveredProducerPaths = new Set(
+      sourceFiles
+        .filter((filePath) => extractEmittedErrorCodes(filePath).errorCodeAssignmentCount > 0)
+        .map((filePath) => path.relative(repoRoot, filePath)),
     );
+    for (const excludedPath of EXCLUDED_ERROR_CODE_SOURCE_FILES.keys()) {
+      expect(discoveredProducerPaths, `${excludedPath} exclusion must name a discovered errorCode source`).toContain(
+        excludedPath,
+      );
+    }
+    const producerFiles = sourceFiles.filter((filePath) => {
+      if (extractEmittedErrorCodes(filePath).errorCodeAssignmentCount === 0) return false;
+      return !EXCLUDED_ERROR_CODE_SOURCE_FILES.has(path.relative(repoRoot, filePath));
+    });
 
     expect(producerFiles.length, "adapter errorCode producer discovery must not be empty").toBeGreaterThan(0);
     const derivedCodes = new Set<string>();
@@ -289,7 +410,11 @@ describe("classifyAdapterFailureForRecovery", () => {
     }
 
     expect(derivedCodes.size).toBeGreaterThan(0);
+    for (const excludedCode of NON_ADAPTER_FAILURE_ERROR_CODE_EXCLUSIONS.keys()) {
+      expect(derivedCodes, `${excludedCode} exclusion must name a derived error code`).toContain(excludedCode);
+    }
     for (const errorCode of derivedCodes) {
+      if (NON_ADAPTER_FAILURE_ERROR_CODE_EXCLUSIONS.has(errorCode)) continue;
       expect(
         ADAPTER_FAILURE_RECOVERY_ERROR_CODES.has(errorCode) ||
           INTENTIONALLY_UNCLASSIFIED_ADAPTER_FAILURE_ERROR_CODES.has(errorCode),
