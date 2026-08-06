@@ -29,7 +29,7 @@ coalesced_duplicate_rows AS (
   UPDATE "agent_wakeup_requests" AS duplicate
   SET "status" = 'coalesced',
       "finished_at" = coalesce(duplicate."finished_at", duplicate."claimed_at", duplicate."requested_at", duplicate."created_at", now()),
-      "error" = concat_ws(E'\n', nullif(duplicate."error", ''), '0209_agent_wakeup_live_idempotency.sql coalesced a pre-existing duplicate live idempotency row before adding the unique index.'),
+      "error" = concat_ws(E'\n', nullif(duplicate."error", ''), '0203_agent_wakeup_live_idempotency.sql coalesced a pre-existing duplicate live idempotency row before adding the unique index.'),
       "updated_at" = now()
   FROM ranked_live_duplicates AS ranked
   WHERE duplicate."id" = ranked."id"

@@ -245,7 +245,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
   );
 
   it(
-    "coalesces duplicate live wake idempotency rows before replaying migration 0203",
+    "coalesces duplicate live wake idempotency rows before replaying migration 0209",
     async () => {
       const connectionString = await createTempDatabase();
 
@@ -361,7 +361,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
           coalesced_count: 1,
         });
         expect(rows[1].status).toBe("coalesced");
-        expect(rows[1].error).toContain("0209_agent_wakeup_live_idempotency.sql coalesced");
+        expect(rows[1].error).toContain("0203_agent_wakeup_live_idempotency.sql coalesced");
 
         const liveRows = await verifySql.unsafe<{ count: string }[]>(`
           SELECT count(*)::text AS count
