@@ -161,6 +161,18 @@ export async function drainHeartbeatRunsWithShutdownLogging(input: {
   }
 }
 
+export async function stopEmbeddedPostgresWithShutdownLogging(input: {
+  signal: "SIGINT" | "SIGTERM";
+  stopEmbeddedPostgres: () => Promise<void>;
+}) {
+  logger.info({ signal: input.signal }, "Stopping embedded PostgreSQL");
+  try {
+    await input.stopEmbeddedPostgres();
+  } catch (err) {
+    logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
+  }
+}
+
 export async function runServerShutdownSequence(input: ServerShutdownSequenceInput): Promise<never> {
   input.stopHeartbeatScheduler();
 
@@ -177,12 +189,10 @@ export async function runServerShutdownSequence(input: ServerShutdownSequenceInp
   input.appShutdown?.();
 
   if (input.stopEmbeddedPostgres) {
-    logger.info({ signal: input.signal }, "Stopping embedded PostgreSQL");
-    try {
-      await input.stopEmbeddedPostgres();
-    } catch (err) {
-      logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
-    }
+    await stopEmbeddedPostgresWithShutdownLogging({
+      signal: input.signal,
+      stopEmbeddedPostgres: input.stopEmbeddedPostgres,
+    });
   }
 
   // Flush buffered OTel spans before the process goes away; without this
@@ -1612,7 +1622,12 @@ export async function startServer(): Promise<StartedServer> {
         logger.error({ err, signal }, "run-log in-flight mirror flush failed");
       });
       (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown?.();
-      if (embeddedPostgres && embeddedPostgresStartedByThisProcess) await embeddedPostgres.stop();
+      if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
+        await stopEmbeddedPostgresWithShutdownLogging({
+          signal,
+          stopEmbeddedPostgres: () => embeddedPostgres.stop(),
+        });
+      }
       await shutdownInstrumentation();
       process.exit(0);
     };

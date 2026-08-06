@@ -3,6 +3,7 @@ import { logger } from "./middleware/logger.js";
 import {
   drainHeartbeatRunsWithShutdownLogging,
   runServerShutdownSequence,
+  stopEmbeddedPostgresWithShutdownLogging,
 } from "./index.js";
 
 describe("server shutdown heartbeat drain", () => {
@@ -50,6 +51,27 @@ describe("server shutdown heartbeat drain", () => {
       );
     } finally {
       errorLog.mockRestore();
+    }
+  });
+
+  it("logs the embedded Postgres stop before invoking it", async () => {
+    const calls: string[] = [];
+    const infoLog = vi.spyOn(logger, "info").mockImplementation((...args: unknown[]) => {
+      if (args[1] === "Stopping embedded PostgreSQL") calls.push("postgres-stop-log");
+      return logger;
+    });
+    try {
+      await stopEmbeddedPostgresWithShutdownLogging({
+        signal: "SIGTERM",
+        stopEmbeddedPostgres: async () => { calls.push("postgres-stop"); },
+      });
+      expect(calls).toEqual(["postgres-stop-log", "postgres-stop"]);
+      expect(infoLog).toHaveBeenCalledWith(
+        { signal: "SIGTERM" },
+        "Stopping embedded PostgreSQL",
+      );
+    } finally {
+      infoLog.mockRestore();
     }
   });
 });
