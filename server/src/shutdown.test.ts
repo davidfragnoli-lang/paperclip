@@ -75,6 +75,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
   it("falls back to the scheduler idle wait when hot-restart preparation fails", async () => {
     const preparationError = new Error("snapshot failed");
     const waitForHeartbeatSchedulerIdle = vi.fn(async () => undefined);
+    const reportPreparationError = vi.fn();
 
     const result = await coordinateHeartbeatSchedulerShutdown({
       signal: "SIGTERM",
@@ -82,9 +83,15 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
         throw preparationError;
       }),
       waitForHeartbeatSchedulerIdle,
+      reportPreparationError,
     });
 
     expect(waitForHeartbeatSchedulerIdle).toHaveBeenCalledOnce();
+    expect(reportPreparationError).toHaveBeenCalledOnce();
+    expect(reportPreparationError).toHaveBeenCalledWith(preparationError, {
+      signal: "SIGTERM",
+      resolvedMode: "graceful_drain",
+    });
     expect(result).toEqual({
       hotRestart: null,
       preparationError,

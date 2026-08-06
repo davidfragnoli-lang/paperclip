@@ -1545,15 +1545,29 @@ export async function startServer(): Promise<StartedServer> {
         signal,
         prepareHotRestartShutdown,
         waitForHeartbeatSchedulerIdle,
+        reportPreparationError: (err, context) => {
+          logger.error(
+            { err, ...context },
+            "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
+          );
+        },
       });
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+      const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
+      if (skipHeartbeatDrain) {
+        logger.info(
+          { signal, hotRestart: heartbeatShutdown.hotRestart },
+          "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
+        );
+      }
+
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
         telemetryClient.stop();
         await telemetryClient.flush();
       }
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-        await drainHeartbeatRunsForShutdown(signal).catch((err) => {
+        await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds).catch((err) => {
           logger.error({ err, signal }, "graceful heartbeat run drain failed");
         });
       }
