@@ -1468,6 +1468,37 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
   }
 
+  async function findOpenExecutionPredecessor(
+    routine: typeof routines.$inferSelect,
+    executor: Db,
+    dispatchFingerprint: string,
+    origin: { kind: string; id: string | null },
+  ) {
+    return executor
+      .select({ issue: issues })
+      .from(issues)
+      .innerJoin(
+        routineRuns,
+        and(
+          sql`cast(${routineRuns.id} as text) = ${issues.originRunId}`,
+          eq(routineRuns.routineId, routine.id),
+        ),
+      )
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, origin.kind),
+          origin.id === null ? isNull(issues.originId) : eq(issues.originId, origin.id),
+          eq(issues.originFingerprint, dispatchFingerprint),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          visibleIssueCondition(),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0]?.issue ?? null);
+  }
+
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
     return executor
       .update(routineRuns)
@@ -1784,6 +1815,13 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        const predecessor = input.routine.concurrencyPolicy === "always_enqueue"
+          ? null
+          : await findOpenExecutionPredecessor(input.routine, txDb, dispatchFingerprint, {
+              kind: issueOriginKind,
+              id: issueOriginId,
+            });
+
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -1808,6 +1846,26 @@ export function routineService(
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
           });
+
+          if (predecessor) {
+            const successorIdentifier = createdIssue.identifier;
+            if (!successorIdentifier) throw new Error("Routine successor issue is missing an identifier");
+            const prefix = successorIdentifier.split("-", 1)[0];
+            await db.transaction(async (carrierTx) => {
+              await issueSvc.update(predecessor.id, {
+                status: "cancelled",
+                actorAgentId: null,
+                actorUserId: null,
+              }, carrierTx);
+              await issueSvc.addComment(
+                predecessor.id,
+                `Superseded by [${successorIdentifier}](/${prefix}/issues/${successorIdentifier}) for the next execution of this routine.`,
+                {},
+                { authorType: "system" },
+                carrierTx,
+              );
+            });
+          }
         } catch (error) {
           const isOpenExecutionConflict =
             !!error &&

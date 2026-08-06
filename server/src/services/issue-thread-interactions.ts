@@ -1324,6 +1324,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
           result: {
             version: 1,
             outcome: "accepted",
+            targetMutationApplied: false,
             ...(selectedOptionIds ? { selectedOptionIds } : {}),
           },
           resolvedByAgentId: args.actor.agentId ?? null,

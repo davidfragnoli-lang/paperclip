@@ -349,6 +349,51 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     return { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId };
   }
 
+  async function seedWakelessNonTerminalFixture() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const ownerUserId = randomUUID();
+    const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: ownerUserId,
+      membershipRole: "owner",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Wakeless assignee",
+      role: "engineer",
+      status: "idle",
+      adapterType: "test_adapter",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Synthetic wakeless non-terminal issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    return { companyId, agentId, issueId };
+  }
+
   it("keeps liveness findings advisory when auto recovery is disabled", async () => {
     await instanceSettingsService(db).updateExperimental({
       enableIssueGraphLivenessAutoRecovery: false,
@@ -459,6 +504,48 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         expect.objectContaining({ id: "choose_review_path", label: "Choose review path" }),
       ]),
     });
+  });
+
+  it("serializes concurrent wakeless backstop scans to one live wake and one run", async () => {
+    const { companyId, agentId, issueId } = await seedWakelessNonTerminalFixture();
+    const heartbeat = heartbeatService(db);
+
+    const [first, second] = await Promise.all([
+      heartbeat.reconcileIssueGraphLiveness(),
+      heartbeat.reconcileIssueGraphLiveness(),
+    ]);
+
+    const wakes = await db
+      .select({
+        id: agentWakeupRequests.id,
+        status: agentWakeupRequests.status,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)))
+      .orderBy(agentWakeupRequests.requestedAt);
+    const runs = await db
+      .select({
+        id: heartbeatRuns.id,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        status: heartbeatRuns.status,
+      })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)))
+      .orderBy(heartbeatRuns.createdAt);
+
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.idempotencyKey).toBe(`non-terminal-wakeless:${issueId}:cold`);
+    expect(["queued", "claimed", "completed", "deferred_issue_execution"]).toContain(wakes[0]?.status);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.wakeupRequestId).toBe(wakes[0]?.id);
+    expect(["queued", "running", "succeeded"]).toContain(runs[0]?.status);
+
+    expect(first.wakelessNonTerminalHealed + second.wakelessNonTerminalHealed).toBe(1);
+    expect(
+      first.wakelessNonTerminalExistingWakeSkipped + second.wakelessNonTerminalExistingWakeSkipped,
+    ).toBe(1);
+    expect(first.wakelessNonTerminalEnqueueFailed + second.wakelessNonTerminalEnqueueFailed).toBe(0);
   });
 
   it("keeps resolved dependency wake reconciliation active when liveness auto recovery is disabled", async () => {

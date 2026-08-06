@@ -14,6 +14,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
   issues,
   projects,
@@ -130,6 +131,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   async function cleanupRetryFixtureOnce() {
     await db.delete(activityLog);
     await db.delete(environmentLeases);
+    await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
@@ -1614,6 +1616,9 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     }).where(eq(issues.id, issueId));
 
     // Keep the new agent's queue from auto-claiming/executing during this unit test.
+    // Slot accounting intentionally ignores old zero-evidence running rows, so
+    // give these synthetic holders durable output evidence instead of relying on
+    // their historical startedAt timestamp.
     await db.insert(heartbeatRuns).values(
       Array.from({ length: 5 }, () => ({
         id: randomUUID(),
@@ -1626,6 +1631,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           wakeReason: "test_busy_slot",
         },
         startedAt: now,
+        lastOutputAt: now,
         updatedAt: now,
         createdAt: now,
       })),

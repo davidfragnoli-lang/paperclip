@@ -75,7 +75,10 @@ import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
-import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
+import {
+  isIsolatedWorktreeRuntimeConfigured,
+  maybePersistWorktreeRuntimePorts,
+} from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
@@ -86,6 +89,16 @@ import {
 } from "./shutdown.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
+import {
+  clearRuntimeStartupState,
+  writeRuntimeStartupState,
+} from "./runtime-startup-state.js";
+import {
+  claimRuntimePrimaryLease,
+  currentRuntimePrimaryLeaseMatches,
+  readRuntimePrimaryLease,
+  releaseRuntimePrimaryLeaseForPid,
+} from "./runtime-primary-instance.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -128,12 +141,92 @@ export interface StartedServer {
   databaseUrl: string;
 }
 
+export type ServerShutdownSequenceInput = {
+  signal: "SIGINT" | "SIGTERM";
+  stopHeartbeatScheduler: () => void;
+  waitForHeartbeatSchedulerIdle: () => Promise<void>;
+  drainHeartbeatRunsForShutdown?: ((signal: "SIGINT" | "SIGTERM") => Promise<unknown>) | null;
+  stopTelemetry: () => Promise<void>;
+  appShutdown?: (() => void) | null;
+  stopEmbeddedPostgres?: (() => Promise<void>) | null;
+  shutdownInstrumentation: () => Promise<void>;
+  exitProcess: (code: number) => never;
+};
+
+export async function drainHeartbeatRunsWithShutdownLogging(input: {
+  signal: "SIGINT" | "SIGTERM";
+  drainHeartbeatRunsForShutdown: (signal: "SIGINT" | "SIGTERM") => Promise<unknown>;
+}) {
+  try {
+    const drain = await input.drainHeartbeatRunsForShutdown(input.signal);
+    logger.info({ signal: input.signal, drain }, "graceful heartbeat run drain complete");
+    return drain;
+  } catch (err) {
+    logger.error({ err, signal: input.signal }, "graceful heartbeat run drain failed");
+    return null;
+  }
+}
+
+export async function stopEmbeddedPostgresWithShutdownLogging(input: {
+  signal: "SIGINT" | "SIGTERM";
+  stopEmbeddedPostgres: () => Promise<void>;
+}) {
+  logger.info({ signal: input.signal }, "Stopping embedded PostgreSQL");
+  try {
+    await input.stopEmbeddedPostgres();
+  } catch (err) {
+    logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
+  }
+}
+
+export async function runServerShutdownSequence(input: ServerShutdownSequenceInput): Promise<never> {
+  input.stopHeartbeatScheduler();
+
+  if (input.drainHeartbeatRunsForShutdown) {
+    await drainHeartbeatRunsWithShutdownLogging({
+      signal: input.signal,
+      drainHeartbeatRunsForShutdown: input.drainHeartbeatRunsForShutdown,
+    });
+  }
+
+  await input.waitForHeartbeatSchedulerIdle();
+  await input.stopTelemetry();
+
+  input.appShutdown?.();
+
+  if (input.stopEmbeddedPostgres) {
+    await stopEmbeddedPostgresWithShutdownLogging({
+      signal: input.signal,
+      stopEmbeddedPostgres: input.stopEmbeddedPostgres,
+    });
+  }
+
+  // Flush buffered OTel spans before the process goes away; without this
+  // await the exporter's final batch is dropped on exit.
+  await input.shutdownInstrumentation();
+
+  return input.exitProcess(0);
+}
+
 export async function startServer(): Promise<StartedServer> {
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
   ensureDecisionSigningSecret();
   let config = loadConfig();
+  const startupStateStartedAt = new Date().toISOString();
+  const writeStartupState = (
+    phase: "booting" | "migrating" | "starting-http",
+    extra?: { databaseLabel?: string | null },
+  ) =>
+    writeRuntimeStartupState({
+      pid: process.pid,
+      phase,
+      startedAt: startupStateStartedAt,
+      updatedAt: new Date().toISOString(),
+      databaseLabel: extra?.databaseLabel ?? null,
+    });
+  writeStartupState("booting");
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;
@@ -270,6 +363,33 @@ export async function startServer(): Promise<StartedServer> {
       return rawUrl;
     }
   }
+
+  function shouldRewriteConfiguredApiUrlForRuntimePort(rawUrl: string | undefined, bindHost: string): boolean {
+    if (!rawUrl) return false;
+    try {
+      const parsed = new URL(rawUrl);
+      const hostname = parsed.hostname.trim().toLowerCase();
+      const normalizedBindHost = bindHost.trim().toLowerCase();
+      if (!hostname || !parsed.port) return false;
+      return (
+        hostname === "localhost" ||
+        hostname === "127.0.0.1" ||
+        hostname === "::1" ||
+        (normalizedBindHost.length > 0 && hostname === normalizedBindHost)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function normalizeUrlToOrigin(rawUrl: string | undefined): string | undefined {
+    if (!rawUrl) return undefined;
+    try {
+      return new URL(rawUrl).origin;
+    } catch {
+      return rawUrl;
+    }
+  }
   
   const LOCAL_BOARD_USER_ID = "local-board";
   const LOCAL_BOARD_USER_EMAIL = "local@paperclip.local";
@@ -344,6 +464,7 @@ export async function startServer(): Promise<StartedServer> {
   assertCloudDatabaseContract();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
+    writeStartupState("migrating", { databaseLabel: "PostgreSQL" });
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
   
     db = createDb(config.databaseUrl);
@@ -511,6 +632,7 @@ export async function startServer(): Promise<StartedServer> {
     if (shouldAutoApplyFirstRunMigrations) {
       logger.info("Detected first-run embedded PostgreSQL setup; applying pending migrations automatically");
     }
+    writeStartupState("migrating", { databaseLabel: "Embedded PostgreSQL" });
     migrationSummary = await ensureMigrations(embeddedConnectionString, "Embedded PostgreSQL", {
       autoApply: shouldAutoApplyFirstRunMigrations,
     });
@@ -550,9 +672,104 @@ export async function startServer(): Promise<StartedServer> {
 
   const requestedListenPort = config.port;
   const listenPort = await detectPort(requestedListenPort);
-  if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
-    config.authPublicBaseUrl = rewriteLocalUrlPort(config.authPublicBaseUrl, listenPort);
-  }
+  const isIsolatedWorktreeRuntime = isIsolatedWorktreeRuntimeConfigured();
+  const isPrimaryRuntimePort = listenPort === requestedListenPort || isIsolatedWorktreeRuntime;
+  const primaryRuntimeLeasePort = isIsolatedWorktreeRuntime ? listenPort : requestedListenPort;
+  let isPrimaryRuntimeInstance = false;
+  let primaryRuntimeLeaseReleased = false;
+  let primaryHeartbeatStartupRecoveryPending = true;
+  const releasePrimaryRuntimeLease = () => {
+    if (!isPrimaryRuntimeInstance || primaryRuntimeLeaseReleased) return;
+    primaryRuntimeLeaseReleased = true;
+    releaseRuntimePrimaryLeaseForPid(process.pid);
+  };
+  let primaryRuntimeExitHookRegistered = false;
+  const setPrimaryRuntimeInstance = (next: boolean) => {
+    isPrimaryRuntimeInstance = next;
+    process.env.PAPERCLIP_PRIMARY_RUNTIME_INSTANCE = next ? "true" : "false";
+    if (next && !primaryRuntimeExitHookRegistered) {
+      primaryRuntimeExitHookRegistered = true;
+      process.once("exit", releasePrimaryRuntimeLease);
+    }
+  };
+  const ensurePrimaryRuntimeOwnership = (reason: "startup" | "periodic") => {
+    if (!isPrimaryRuntimePort) {
+      setPrimaryRuntimeInstance(false);
+      return { primary: false, newlyAcquired: false };
+    }
+    const lease = readRuntimePrimaryLease();
+    const ownsLease = currentRuntimePrimaryLeaseMatches(lease);
+    if (ownsLease) {
+      setPrimaryRuntimeInstance(true);
+      return { primary: true, newlyAcquired: false };
+    }
+    const claimedLease = claimRuntimePrimaryLease({
+      pid: process.pid,
+      requestedPort: primaryRuntimeLeasePort,
+      startedAt: startupStateStartedAt,
+    });
+    if (claimedLease.acquired) {
+      logger.info(
+        {
+          reason,
+          leasePath: claimedLease.leasePath,
+          currentPid: process.pid,
+          previousPid: claimedLease.existing?.pid ?? null,
+          previousStartedAt: claimedLease.existing?.startedAt ?? null,
+        },
+        "runtime acquired primary lease ownership after prior owner exited",
+      );
+      setPrimaryRuntimeInstance(true);
+      return { primary: true, newlyAcquired: true };
+    }
+    if (isPrimaryRuntimeInstance) {
+      logger.warn(
+        {
+          reason,
+          requestedPort: requestedListenPort,
+          selectedPort: listenPort,
+          currentPid: process.pid,
+          leaseOwnerPid: lease?.pid ?? null,
+          leaseOwnerStartedAt: lease?.startedAt ?? null,
+        },
+        "runtime lost primary lease ownership; suppressing primary-only work",
+      );
+    } else if (claimedLease.existing?.pid) {
+      logger.info(
+        {
+          reason,
+          requestedPort: requestedListenPort,
+          selectedPort: listenPort,
+          currentPid: process.pid,
+          leaseOwnerPid: claimedLease.existing.pid,
+          leaseOwnerStartedAt: claimedLease.existing.startedAt,
+        },
+        "runtime deferring primary-only work until the previous lease owner exits",
+      );
+    }
+    setPrimaryRuntimeInstance(false);
+    return { primary: false, newlyAcquired: false };
+  };
+  setPrimaryRuntimeInstance(false);
+  try {
+    if (
+      config.deploymentMode === "authenticated"
+      && config.deploymentExposure === "public"
+      && listenPort !== requestedListenPort
+    ) {
+      throw new Error(
+        `authenticated public deployments require requested listen port ${requestedListenPort} to be available; refusing fallback to ${listenPort}`,
+      );
+    }
+    if (listenPort !== requestedListenPort && !isIsolatedWorktreeRuntime) {
+      throw new Error(
+        `requested listen port ${requestedListenPort} is already in use; refusing fallback to ${listenPort} ` +
+          "because this runtime is not configured as an isolated worktree instance",
+      );
+    }
+    if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
+      config.authPublicBaseUrl = rewriteLocalUrlPort(config.authPublicBaseUrl, listenPort);
+    }
   
   let authReady = config.deploymentMode === "local_trusted";
   let betterAuthHandler: RequestHandler | undefined;
@@ -619,27 +836,9 @@ export async function startServer(): Promise<StartedServer> {
     serverPort: listenPort,
     databasePort: resolvedEmbeddedPostgresPort,
   });
-  // Cloud managed-config contract (harness → app). Parse PAPERCLIP_MANAGED_CONFIG
-  // once so a malformed document (blank value, bad JSON, unknown feature key,
-  // unsupported v, missing section) refuses startup with a precise error instead
-  // of silently running without the feature overlay. Absent env = self-hosted:
-  // nothing changes. The parsed document is never persisted; instanceSettingsService
-  // overlays it per read. This MUST run before any instanceSettingsService(db)
-  // construction — that constructor parses the same env, and it would otherwise
-  // throw first, bypassing this fail-closed log path.
   let managedConfig: ManagedInstanceConfig | null;
   try {
     managedConfig = getManagedInstanceConfig();
-    if (managedConfig) {
-      logger.warn(
-        {
-          catalogVersion: managedConfig.catalogVersion,
-          managedFeatureKeys: Object.keys(managedConfig.features).sort(),
-          autoInstallPlugins: [...managedConfig.plugins.autoInstall],
-        },
-        "cloud managed configuration active",
-      );
-    }
   } catch (err) {
     logger.error({ err }, "invalid PAPERCLIP_MANAGED_CONFIG; refusing to start (fail closed)");
     throw err;
@@ -789,7 +988,12 @@ export async function startServer(): Promise<StartedServer> {
     bindHost: runtimeListenHost,
     port: listenPort,
   });
-  const configuredApiUrl = process.env.PAPERCLIP_API_URL?.trim() || runtimeApiUrl;
+  const inheritedApiUrl = process.env.PAPERCLIP_API_URL?.trim();
+  const publicApiUrl = normalizeUrlToOrigin(config.authPublicBaseUrl ?? undefined);
+  const configuredApiUrl =
+    inheritedApiUrl && shouldRewriteConfiguredApiUrlForRuntimePort(inheritedApiUrl, runtimeListenHost)
+      ? normalizeUrlToOrigin(rewriteLocalUrlPort(inheritedApiUrl, listenPort)) ?? runtimeApiUrl
+      : inheritedApiUrl || publicApiUrl || runtimeApiUrl;
   const runtimeApiCandidates = buildRuntimeApiCandidateUrls({
     preferredApiUrl: configuredApiUrl,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
@@ -799,6 +1003,7 @@ export async function startServer(): Promise<StartedServer> {
   });
   process.env.PAPERCLIP_LISTEN_HOST = runtimeListenHost;
   process.env.PAPERCLIP_LISTEN_PORT = String(listenPort);
+  ensurePrimaryRuntimeOwnership("startup");
   process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
@@ -811,104 +1016,80 @@ export async function startServer(): Promise<StartedServer> {
     resolveSessionFromHeaders,
   });
 
-  void reconcilePersistedRuntimeServicesOnStartup(db as any)
-    .then((result) => {
-      if (result.reconciled > 0) {
-        logger.warn(
-          { reconciled: result.reconciled },
-          "reconciled persisted runtime services from a previous server process",
-        );
-      }
-    })
-    .catch((err) => {
-      logger.error({ err }, "startup reconciliation of persisted runtime services failed");
-    });
+  if (isPrimaryRuntimeInstance) {
+    void reconcilePersistedRuntimeServicesOnStartup(db as any)
+      .then((result) => {
+        if (result.reconciled > 0) {
+          logger.warn(
+            { reconciled: result.reconciled },
+            "reconciled persisted runtime services from a previous server process",
+          );
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "startup reconciliation of persisted runtime services failed");
+      });
 
-  // Backfill auth.json into any already-isolated codex_local managed home that
-  // was created by the #8272 isolation guard before the Phase 1 seeding fix.
-  // Idempotent; the Phase 1 execute-time seeding covers new strandings.
-  void reconcileCodexLocalManagedHomesOnStartup(db)
-    .then((result) => {
-      if (result.seeded > 0 || result.failed > 0) {
-        logger.warn(
-          { seeded: result.seeded, failed: result.failed, scanned: result.scanned },
-          "reconciled codex_local managed homes (backfilled missing auth)",
-        );
-      }
-      if (result.sourceAuthMissing > 0) {
-        logger.warn(
-          { sourceAuthMissing: result.sourceAuthMissing, scanned: result.scanned },
-          "could not backfill codex_local managed homes because shared Codex auth is missing",
-        );
-      }
-    })
-    .catch((err) => {
-      logger.error({ err }, "startup reconciliation of codex_local managed homes failed");
-    });
+    // Backfill auth.json into any already-isolated codex_local managed home that
+    // was created by the #8272 isolation guard before the Phase 1 seeding fix.
+    // Idempotent; the Phase 1 execute-time seeding covers new strandings.
+    void reconcileCodexLocalManagedHomesOnStartup(db)
+      .then((result) => {
+        if (result.seeded > 0 || result.failed > 0) {
+          logger.warn(
+            { seeded: result.seeded, failed: result.failed, scanned: result.scanned },
+            "reconciled codex_local managed homes (backfilled missing auth)",
+          );
+        }
+        if (result.sourceAuthMissing > 0) {
+          logger.warn(
+            { sourceAuthMissing: result.sourceAuthMissing, scanned: result.scanned },
+            "could not backfill codex_local managed homes because shared Codex auth is missing",
+          );
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "startup reconciliation of codex_local managed homes failed");
+      });
 
-  void reconcileBuiltInAgentsOnStartup(db as any)
-    .then((result) => {
-      if (
-        result.reconciled > 0
-        || result.unknown > 0
-        || result.duplicates > 0
-        || result.autoEnsured > 0
-        || result.companyFailures > 0
-      ) {
+    void reconcileBuiltInAgentsOnStartup(db as any)
+      .then((result) => {
+        if (result.reconciled > 0 || result.unknown > 0 || result.duplicates > 0 || result.autoEnsured > 0) {
+          logger.warn(
+            result,
+            "startup reconciliation of built-in agents complete",
+          );
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "startup reconciliation of built-in agents failed");
+      });
+
+    // Force the instance onto the Kubernetes sandbox provider when configured via
+    // env (PAPERCLIP_EXECUTION_MODE=kubernetes). Runs BEFORE the heartbeat resumes
+    // queued runs so the policy + managed k8s environments are in place. A bad
+    // PAPERCLIP_EXECUTION_MODE / PAPERCLIP_K8S_* value throws and fails startup
+    // (fail-loud) rather than silently allowing local execution.
+    try {
+      const policyResult = await bootstrapExecutionPolicyFromEnv(db as any);
+      if (policyResult) {
         logger.warn(
-          result,
-          "startup reconciliation of built-in agents complete",
+          {
+            executionMode: policyResult.executionMode,
+            companiesConfigured: policyResult.companiesConfigured,
+          },
+          "forced execution policy applied at startup",
         );
       }
-    })
-    .catch((err) => {
-      logger.error({ err }, "startup reconciliation of built-in agents failed");
-    });
-
-  // Force the instance onto the Kubernetes sandbox provider when configured via
-  // env (PAPERCLIP_EXECUTION_MODE=kubernetes). Runs BEFORE the heartbeat resumes
-  // queued runs so the policy + managed k8s environments are in place. A bad
-  // PAPERCLIP_EXECUTION_MODE / PAPERCLIP_K8S_* value throws and fails startup
-  // (fail-loud) rather than silently allowing local execution.
-  try {
-    const policyResult = await bootstrapExecutionPolicyFromEnv(db as any);
-    if (policyResult) {
-      logger.warn(
-        {
-          executionMode: policyResult.executionMode,
-          companiesConfigured: policyResult.companiesConfigured,
-        },
-        "forced execution policy applied at startup",
-      );
+    } catch (err) {
+      logger.error({ err }, "failed to apply forced execution policy from environment");
+      throw err;
     }
-  } catch (err) {
-    logger.error({ err }, "failed to apply forced execution policy from environment");
-    throw err;
-  }
-
-  // Ensure sandbox environments declared in the managed-config document
-  // (`environments` section) before the heartbeat resumes queued runs. The
-  // document already parsed fail-closed above; the ensure step itself is
-  // fail-safe per entry (a degraded boot beats a fleet-wide crash loop), but
-  // a contradictory deployment that also forces PAPERCLIP_EXECUTION_MODE
-  // throws here and fails startup. `pluginsReady` sequences the ensure after
-  // the bundled-plugin install/load pass so a declared environment never
-  // activates before its provider driver is registered; the worker manager
-  // additionally gates each entry on a live plugin worker (and archives the
-  // row of a provider that did not come up).
-  try {
-    const bundledPluginsStartup = (app as { locals?: { bundledPluginsStartup?: Promise<unknown> } })
-      .locals?.bundledPluginsStartup;
-    const managedEnvironmentsResult = await applyManagedEnvironments(db as any, managedConfig, {
-      pluginsReady: bundledPluginsStartup,
-      workerManager: pluginWorkerManager,
-    });
-    if (managedEnvironmentsResult) {
-      logger.warn(managedEnvironmentsResult, "managed sandbox environments ensured from managed config");
-    }
-  } catch (err) {
-    logger.error({ err }, "failed to apply managed environments from managed config");
-    throw err;
+  } else {
+    logger.warn(
+      { requestedPort: requestedListenPort, selectedPort: listenPort },
+      "skipping global startup reconciliation because this runtime instance is not primary",
+    );
   }
 
   let drainHeartbeatRunsForShutdown: ((
@@ -919,8 +1100,11 @@ export async function startServer(): Promise<StartedServer> {
     skipDrain: boolean;
     drainRunIds?: string[];
   }>) | null = null;
+  let quiesceHeartbeatRunDispatchForShutdown: (() => void) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  let shouldRunPrimaryHeartbeatStartupRecovery = false;
+  let runPrimaryHeartbeatStartupRecovery: (() => Promise<boolean>) | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -968,6 +1152,7 @@ export async function startServer(): Promise<StartedServer> {
       heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
     );
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
+    quiesceHeartbeatRunDispatchForShutdown = heartbeat.quiesceRunDispatchForShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);
@@ -1023,31 +1208,31 @@ export async function startServer(): Promise<StartedServer> {
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
     // into a dead "running" row during startup recovery.
-    if (heartbeatSchedulingSuppression.suppressed) {
-      logger.warn(
-        { reason: heartbeatSchedulingSuppression.reason },
-        "heartbeat scheduling suppressed for this runtime instance",
-      );
-    } else {
+    runPrimaryHeartbeatStartupRecovery = async () => {
+      if (!ensurePrimaryRuntimeOwnership("startup").primary) return false;
+      primaryHeartbeatStartupRecoveryPending = false;
       const startupHeartbeatRecovery = (async () => {
         try {
-          const hotRestart = await heartbeat.reconcileHotRestartAdoption();
-          if (hotRestart.mode === "reported") {
-            logger.info(
-              hotRestart,
-              "startup hot-restart adoption reconciliation complete",
+          const hotRestartAdoption = await heartbeat.reconcileHotRestartAdoption();
+          if (
+            hotRestartAdoption.mode !== "not_requested" &&
+            hotRestartAdoption.mode !== "reported"
+          ) {
+            logger.warn(
+              { ...hotRestartAdoption },
+              "startup hot-restart adoption reconciliation did not complete cleanly",
             );
           }
         } catch (err) {
-          logger.error(
-            { err },
-            "startup hot-restart adoption reconciliation failed - orphan reaper will serve as degraded backstop",
-          );
+          logger.error({ err }, "startup hot-restart adoption reconciliation failed - continuing with orphan reaper");
         }
 
+        const startupOrphanReapStaleThresholdMs = 5 * 60 * 1000;
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
-            const result = await heartbeat.reapOrphanedRuns();
+            const result = await heartbeat.reapOrphanedRuns({
+              staleThresholdMs: startupOrphanReapStaleThresholdMs,
+            });
             logger.info(
               { reaped: result.reaped, runIds: result.runIds },
               "startup reap of orphaned heartbeat runs complete",
@@ -1117,16 +1302,33 @@ export async function startServer(): Promise<StartedServer> {
       });
       trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
       await startupHeartbeatRecovery;
+      return true;
+    };
+
+    shouldRunPrimaryHeartbeatStartupRecovery =
+      ensurePrimaryRuntimeOwnership("startup").primary && !heartbeatSchedulingSuppression.suppressed;
+    if (!isPrimaryRuntimeInstance) {
+      logger.warn(
+        { requestedPort: requestedListenPort, selectedPort: listenPort },
+        "skipping startup background reconciliation because this runtime instance is not primary",
+      );
+    } else if (heartbeatSchedulingSuppression.suppressed) {
+      logger.warn(
+        { reason: heartbeatSchedulingSuppression.reason },
+        "heartbeat scheduling suppressed for this runtime instance",
+      );
     }
 
-    const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
-    if (setupCleanup.timedOut > 0 || setupCleanup.failed > 0) {
-      logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
-    }
+    if (isPrimaryRuntimeInstance) {
+      const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
+      if (setupCleanup.timedOut > 0 || setupCleanup.failed > 0) {
+        logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
+      }
 
-    const toolHealthSweep = await tools.sweepConnectionHealth();
-    if (toolHealthSweep.failed > 0) {
-      logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
+      const toolHealthSweep = await tools.sweepConnectionHealth();
+      if (toolHealthSweep.failed > 0) {
+        logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
+      }
     }
     await decisionExecutor.sweepExpired();
     const runRetentionSweep = async () => {
@@ -1168,6 +1370,17 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const primaryOwnership = ensurePrimaryRuntimeOwnership("periodic");
+        if (!primaryOwnership.primary) return;
+        if (
+          primaryOwnership.newlyAcquired
+          && primaryHeartbeatStartupRecoveryPending
+          && runPrimaryHeartbeatStartupRecovery
+        ) {
+          await runPrimaryHeartbeatStartupRecovery();
+          return;
+        }
+
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
           trackHeartbeatSchedulerWork(heartbeat
             .tickTimers(new Date())
@@ -1199,35 +1412,6 @@ export async function startServer(): Promise<StartedServer> {
           .catch((err) => {
             logger.error({ err }, "routine scheduler tick failed");
           }));
-
-        if (heartbeatSchedulerStopped) return;
-        trackHeartbeatSchedulerWork((async () => {
-          const experimental = await instanceSettingsService(db).getExperimental();
-          if (experimental.enableStatusCards !== true) return;
-          const result = await statusCards.tickDueStatusCards(new Date());
-          await Promise.all(result.enqueued.map(async ({ cardId, generatingIssue }) => {
-            try {
-              await queueIssueAssignmentWakeup({
-                heartbeat,
-                issue: generatingIssue,
-                reason: "status_card_update_assigned",
-                mutation: "status_card.scheduler_update_requested",
-                contextSource: "status_card_scheduler",
-                requestedByActorType: "system",
-                taskKey: `status-card:${cardId}`,
-                rethrowOnError: true,
-              });
-            } catch (err) {
-              await issues.update(generatingIssue.id, { status: "cancelled" });
-              throw err;
-            }
-          }));
-          if (result.evaluated > 0 || result.enqueued.length > 0) {
-            logger.info({ evaluated: result.evaluated, enqueued: result.enqueued.length }, "status-card scheduler tick complete");
-          }
-        })().catch((err) => {
-          logger.error({ err }, "status-card scheduler tick failed");
-        }));
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(environmentCustomImages
@@ -1329,7 +1513,7 @@ export async function startServer(): Promise<StartedServer> {
     });
   }
   
-  if (config.databaseBackupEnabled) {
+  if (config.databaseBackupEnabled && isPrimaryRuntimeInstance) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
     logger.info(
@@ -1345,6 +1529,11 @@ export async function startServer(): Promise<StartedServer> {
         // runServerDatabaseBackup already logs the failure with context.
       });
     }, backupIntervalMs);
+  } else if (config.databaseBackupEnabled) {
+    logger.warn(
+      { requestedPort: requestedListenPort, selectedPort: listenPort },
+      "automatic database backups disabled on non-primary runtime instance",
+    );
   }
   
   // Wait for external adapters to finish loading before accepting requests.
@@ -1364,20 +1553,26 @@ export async function startServer(): Promise<StartedServer> {
     logger.error({ err }, "failed to reconcile adapter availability from PAPERCLIP_ADAPTERS");
     throw err;
   }
+  writeStartupState("starting-http", {
+    databaseLabel:
+      startupDbInfo.mode === "embedded-postgres" ? "Embedded PostgreSQL" : "PostgreSQL",
+  });
 
-  await new Promise<void>((resolveListen, rejectListen) => {
-    const onError = (err: Error) => {
-      server.off("error", onError);
-      rejectListen(err);
+    await new Promise<void>((resolveListen, rejectListen) => {
+      const onError = (err: Error) => {
+        server.off("error", onError);
+        releasePrimaryRuntimeLease();
+        rejectListen(err);
     };
 
-    server.once("error", onError);
-    server.listen(listenPort, config.host, () => {
-      server.off("error", onError);
-      logger.info(`Server listening on ${config.host}:${listenPort}`);
-      void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
-        if (notified) logger.info("Notified systemd that Paperclip is ready");
-      });
+      server.once("error", onError);
+      server.listen(listenPort, config.host, () => {
+        server.off("error", onError);
+        clearRuntimeStartupState();
+        logger.info(`Server listening on ${config.host}:${listenPort}`);
+        void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
+          if (notified) logger.info("Notified systemd that Paperclip is ready");
+        });
       if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {
         const openHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
         const url = `http://${openHost}:${listenPort}`;
@@ -1428,11 +1623,16 @@ export async function startServer(): Promise<StartedServer> {
       resolveListen();
     });
   });
+
+  if (shouldRunPrimaryHeartbeatStartupRecovery && runPrimaryHeartbeatStartupRecovery) {
+    await runPrimaryHeartbeatStartupRecovery();
+  }
   
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
+      quiesceHeartbeatRunDispatchForShutdown?.();
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
@@ -1443,17 +1643,22 @@ export async function startServer(): Promise<StartedServer> {
         prepareHotRestartShutdown,
         waitForHeartbeatSchedulerIdle,
       });
+      if (heartbeatShutdown.preparationError) {
+        logger.error(
+          {
+            err: heartbeatShutdown.preparationError,
+            signal,
+            resolvedMode: "graceful_drain",
+          },
+          "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
+        );
+      }
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
       const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
       if (skipHeartbeatDrain) {
         logger.info(
           { signal, hotRestart: heartbeatShutdown.hotRestart },
           "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
-        );
-      } else if (heartbeatShutdown.preparationError) {
-        logger.error(
-          { err: heartbeatShutdown.preparationError, signal },
-          "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
         );
       }
 
@@ -1462,42 +1667,24 @@ export async function startServer(): Promise<StartedServer> {
         telemetryClient.stop();
         await telemetryClient.flush();
       }
-
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-        try {
-          const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-          logger.info({ signal, drain }, "graceful heartbeat run drain complete");
-        } catch (err) {
-          logger.error({ err, signal }, "graceful heartbeat run drain failed");
-        }
+        await drainHeartbeatRunsWithShutdownLogging({
+          signal,
+          drainHeartbeatRunsForShutdown: (drainSignal) =>
+            drainHeartbeatRunsForShutdown(drainSignal, selectiveDrainRunIds),
+        });
       }
-
-      // Whatever the drain did not finalize (timed-out runs, the hot-restart
-      // skip path) still has a local-only tail when the in-flight run-log
-      // mirror is enabled; upload those tails now so an orderly restart
-      // never loses run output. No-op when the mirror is off.
-      try {
-        await flushInFlightRunLogMirrors();
-      } catch (err) {
+      await flushInFlightRunLogMirrors().catch((err) => {
         logger.error({ err, signal }, "run-log in-flight mirror flush failed");
-      }
-
-      const appShutdown = (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown;
-      appShutdown?.();
-
+      });
+      (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown?.();
       if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
-        logger.info({ signal }, "Stopping embedded PostgreSQL");
-        try {
-          await embeddedPostgres?.stop();
-        } catch (err) {
-          logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
-        }
+        await stopEmbeddedPostgresWithShutdownLogging({
+          signal,
+          stopEmbeddedPostgres: () => embeddedPostgres.stop(),
+        });
       }
-
-      // Flush buffered OTel spans before the process goes away; without this
-      // await the exporter's final batch is dropped on exit.
       await shutdownInstrumentation();
-
       process.exit(0);
     };
 
@@ -1516,6 +1703,10 @@ export async function startServer(): Promise<StartedServer> {
     apiUrl: configuredApiUrl,
     databaseUrl: activeDatabaseConnectionString,
   };
+  } catch (err) {
+    releasePrimaryRuntimeLease();
+    throw err;
+  }
 }
 
 function isMainModule(metaUrl: string): boolean {

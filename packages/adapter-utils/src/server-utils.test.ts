@@ -24,8 +24,41 @@ import {
   stringifyPaperclipWakePayload,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+  LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+
+it("persists a local child completion envelope before the tracked wrapper exits", async () => {
+  const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-child-completion-"));
+  try {
+    const result = await runChildProcess(
+      "durable-completion-run",
+      process.execPath,
+      ["-e", "process.stdout.write('done'); process.exit(0)"],
+      {
+        cwd: process.cwd(),
+        env: { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir },
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+    const envelope = JSON.parse(await fs.readFile(
+      path.join(scratchDir, LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME),
+      "utf8",
+    ));
+    expect(result.exitCode).toBe(0);
+    expect(envelope).toMatchObject({
+      version: 1,
+      runId: "durable-completion-run",
+      exitCode: 0,
+      signal: null,
+    });
+    expect(new Date(envelope.completedAt).toString()).not.toBe("Invalid Date");
+  } finally {
+    await fs.rm(scratchDir, { recursive: true, force: true });
+  }
+});
 
 function isPidAlive(pid: number) {
   try {

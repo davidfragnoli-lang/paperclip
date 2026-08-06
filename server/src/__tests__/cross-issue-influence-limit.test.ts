@@ -125,6 +125,32 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted.map((row) => (row.details as { kind: string }).kind)).toEqual(["comment", "update"]);
   });
 
+  it("still counts and caps genuine cross-issue writes after enforcement", async () => {
+    const fake = counterDb();
+    const base = {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment" as const,
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    };
+
+    for (let attempt = 1; attempt <= CROSS_ISSUE_INFLUENCE_LIMIT; attempt += 1) {
+      await expect(observeCrossIssueInfluence(fake.db as never, base))
+        .resolves.toMatchObject({ count: attempt, allowed: true, mode: "enforce" });
+    }
+    await expect(observeCrossIssueInfluence(fake.db as never, base))
+      .resolves.toMatchObject({
+        count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
+        allowed: false,
+        mode: "enforce",
+      });
+
+    expect(fake.observedCount).toBe(CROSS_ISSUE_INFLUENCE_LIMIT);
+    expect(fake.inserted.at(-1)?.action).toBe("issue.cross_issue_influence_cap_rejected");
+  });
+
   it("does not count same-issue writes", async () => {
     const fake = counterDb(0, {
       contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555" },
@@ -175,7 +201,7 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
+  it("allows an uncounted write when a valid persisted run has no source issue", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -184,10 +210,7 @@ describe("cross-issue influence limit rollout", () => {
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "update",
-    })).rejects.toMatchObject({
-      status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
-    });
+    })).resolves.toBeNull();
     expect(fake.inserted).toEqual([]);
   });
 });
