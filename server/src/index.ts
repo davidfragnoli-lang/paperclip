@@ -147,16 +147,28 @@ export type ServerShutdownSequenceInput = {
   exitProcess: (code: number) => never;
 };
 
+export async function drainHeartbeatRunsWithShutdownLogging(input: {
+  signal: "SIGINT" | "SIGTERM";
+  drainHeartbeatRunsForShutdown: (signal: "SIGINT" | "SIGTERM") => Promise<unknown>;
+}) {
+  try {
+    const drain = await input.drainHeartbeatRunsForShutdown(input.signal);
+    logger.info({ signal: input.signal, drain }, "graceful heartbeat run drain complete");
+    return drain;
+  } catch (err) {
+    logger.error({ err, signal: input.signal }, "graceful heartbeat run drain failed");
+    return null;
+  }
+}
+
 export async function runServerShutdownSequence(input: ServerShutdownSequenceInput): Promise<never> {
   input.stopHeartbeatScheduler();
 
   if (input.drainHeartbeatRunsForShutdown) {
-    try {
-      const drain = await input.drainHeartbeatRunsForShutdown(input.signal);
-      logger.info({ signal: input.signal, drain }, "graceful heartbeat run drain complete");
-    } catch (err) {
-      logger.error({ err, signal: input.signal }, "graceful heartbeat run drain failed");
-    }
+    await drainHeartbeatRunsWithShutdownLogging({
+      signal: input.signal,
+      drainHeartbeatRunsForShutdown: input.drainHeartbeatRunsForShutdown,
+    });
   }
 
   await input.waitForHeartbeatSchedulerIdle();
@@ -1590,8 +1602,10 @@ export async function startServer(): Promise<StartedServer> {
         await telemetryClient.flush();
       }
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-        await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds).catch((err) => {
-          logger.error({ err, signal }, "graceful heartbeat run drain failed");
+        await drainHeartbeatRunsWithShutdownLogging({
+          signal,
+          drainHeartbeatRunsForShutdown: (drainSignal) =>
+            drainHeartbeatRunsForShutdown(drainSignal, selectiveDrainRunIds),
         });
       }
       await flushInFlightRunLogMirrors().catch((err) => {

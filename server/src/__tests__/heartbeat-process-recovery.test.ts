@@ -2400,6 +2400,77 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("finalizes an adopted child under its original run identity from durable issue completion", async () => {
+    const adoptedAt = new Date("2026-03-19T00:07:00.000Z");
+    const completedAt = new Date("2026-03-19T00:07:01.000Z");
+    const { companyId, agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: 999_999_999,
+      now: adoptedAt,
+      updatedAt: adoptedAt,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+    await db.update(heartbeatRuns).set({
+      resultJson: {
+        hotRestart: {
+          adopted: true,
+          adoptedAt: adoptedAt.toISOString(),
+          previousServerPid: 101,
+          newServerPid: 202,
+          processPid: 999_999_999,
+          processGroupId: null,
+        },
+      },
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      createdByRunId: runId,
+      body: "Delivered the guarded-restart fix and recorded final verification.",
+      createdAt: completedAt,
+      updatedAt: completedAt,
+    });
+    await db.update(issues).set({
+      status: "done",
+      checkoutRunId: null,
+      executionRunId: null,
+      completedAt,
+      updatedAt: completedAt,
+    }).where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns({ now: completedAt });
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      id: runId,
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+      processLossRetryCount: 0,
+      resultJson: {
+        summary: "Delivered the guarded-restart fix and recorded final verification.",
+        hotRestartCompletion: {
+          observed: true,
+          issueId,
+          issueStatus: "done",
+          evidence: "run_attributed_terminal_issue_disposition",
+        },
+      },
+    });
+    const wakeup = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("completed");
+  });
+
   it.skipIf(process.platform === "win32")("keeps process-group-only hot-restart adoptions out of process_lost reaping", async () => {
     const orphan = await spawnOrphanedProcessGroup();
     cleanupPids.add(orphan.descendantPid);
@@ -2522,6 +2593,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBe(retryRun?.id);
   });
 
+  it("does not extend restart-recovery lineage beyond one retry", async () => {
+    const { agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processLossRetryCount: 1,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.drainRunningRunsForShutdown(
+      "SIGTERM",
+      new Date("2026-03-19T00:06:00.000Z"),
+    );
+
+    expect(result).toMatchObject({ interruptedRunIds: [runId], retryRunIds: [] });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      id: runId,
+      status: "interrupted",
+      processLossRetryCount: 1,
+    });
+  });
+
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {
     const { runId, wakeupRequestId } = await seedRunFixture({
       agentStatus: "running",
@@ -2606,7 +2699,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(retryRuns[0]?.id).toBe(firstRetry?.id);
   });
 
-  it("chains a single retry when restart recovery is interrupted by a second graceful shutdown", async () => {
+  it("stops restart recovery when the single retry is interrupted by a second graceful shutdown", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "running",
     });
@@ -2638,22 +2731,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       new Date("2026-03-19T00:08:00.000Z"),
     );
     expect(secondDrain.interruptedRunIds).toEqual([firstRetry!.id]);
+    expect(secondDrain.retryRunIds).toEqual([]);
 
     const runs = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs).toHaveLength(3);
+    expect(runs).toHaveLength(2);
     expect(runs.find((row) => row.id === runId)?.status).toBe("interrupted");
     expect(runs.find((row) => row.id === firstRetry!.id)?.status).toBe("interrupted");
 
     const originalRetries = runs.filter((row) => row.retryOfRunId === runId);
     expect(originalRetries).toHaveLength(1);
-    const secondRetry = runs.find((row) => row.retryOfRunId === firstRetry!.id);
-    expect(secondRetry).toMatchObject({
-      status: "queued",
-      processLossRetryCount: 2,
-    });
+    expect(runs.some((row) => row.retryOfRunId === firstRetry!.id)).toBe(false);
+    expect(Math.max(...runs.map((row) => row.processLossRetryCount))).toBe(1);
 
     const issue = await db
       .select()
@@ -2661,7 +2752,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
-    expect(issue?.executionRunId).toBe(secondRetry?.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("releases active environment leases when an orphaned run is reaped", async () => {

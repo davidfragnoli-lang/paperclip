@@ -10284,6 +10284,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
+    if ((run.processLossRetryCount ?? 0) >= 1) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because restart-recovery lineage is exhausted",
+        payload: {
+          processLossRetryCount: run.processLossRetryCount ?? 0,
+          maxProcessLossRetryCount: 1,
+        },
+      });
+      return null;
+    }
+
     const existingRetry = await db
       .select()
       .from(heartbeatRuns)
@@ -13509,6 +13523,99 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function observeAdoptedRunCompletion(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
+    now: Date,
+  ) {
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    if (!issueId) return null;
+
+    const [issue, completionComment] = await Promise.all([
+      db
+        .select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: issueComments.id, body: issueComments.body, createdAt: issueComments.createdAt })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.companyId, run.companyId),
+          eq(issueComments.createdByRunId, run.id),
+          isNull(issueComments.deletedAt),
+        ))
+        .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    if (
+      !issue ||
+      (issue.executionRunId !== null && issue.executionRunId !== run.id) ||
+      !completionComment ||
+      (issue.status !== "done" && issue.status !== "cancelled")
+    ) {
+      return null;
+    }
+
+    const status = issue.status === "done" ? "succeeded" : "cancelled";
+    const resultJson = mergeRunStopMetadataForAgent(agent, status, {
+      resultJson: {
+        ...parseObject(run.resultJson),
+        summary: completionComment.body,
+        hotRestartCompletion: {
+          observed: true,
+          observedAt: now.toISOString(),
+          issueId,
+          issueStatus: issue.status,
+          commentId: completionComment.id,
+          commentCreatedAt: completionComment.createdAt.toISOString(),
+          evidence: "run_attributed_terminal_issue_disposition",
+        },
+      },
+    });
+    const finalized = await setRunStatusIfRunning(run.id, status, {
+      finishedAt: now,
+      error: null,
+      errorCode: null,
+      resultJson,
+    });
+    if (!finalized.updated || !finalized.run) return null;
+
+    let finalizedRun = finalized.run;
+    await setWakeupStatus(run.wakeupRequestId, status === "succeeded" ? "completed" : "cancelled", {
+      finishedAt: now,
+      error: null,
+    });
+    finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, resultJson) ?? finalizedRun;
+    await releaseEnvironmentLeasesForRun({
+      runId: finalizedRun.id,
+      companyId: finalizedRun.companyId,
+      agentId: finalizedRun.agentId,
+      status: finalizedRun.status,
+      failureReason: undefined,
+    });
+    await releaseIssueExecutionAndPromote(finalizedRun);
+    await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Finalized adopted child from durable run-attributed issue completion",
+      payload: {
+        issueId,
+        issueStatus: issue.status,
+        commentId: completionComment.id,
+      },
+    });
+    await finalizeAgentStatus(run.agentId, status, null, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
+    return finalizedRun;
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; now?: Date }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = opts?.now ?? new Date();
@@ -13642,6 +13749,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
       if (hotRestartAdoption) {
+        const completion = await observeAdoptedRunCompletion(run, { adapterType, adapterConfig }, now);
+        if (completion) {
+          logger.info(
+            {
+              runId: run.id,
+              status: completion.status,
+              adoptedAt: hotRestartAdoption.adoptedAt,
+            },
+            "hot-restart adopted child completion observed under original run identity",
+          );
+          continue;
+        }
         const recovery = await drainRunningRunsForShutdown("SIGTERM", now, [run.id]);
         if (recovery.interruptedRunIds.includes(run.id)) {
           logger.warn(
