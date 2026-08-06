@@ -141,15 +141,21 @@ Use `--drain-required` only when the deploy intentionally requires the old termi
 When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eager
 `SIGINT`/`SIGTERM` cleanup hooks. Paperclip owns signal ordering so the heartbeat
 snapshot and any required drain complete while the database is still available;
-the coordinated shutdown path stops embedded PostgreSQL afterward.
+the coordinated shutdown path stops embedded PostgreSQL afterward. If the
+shutdown database query still fails, Paperclip logs the error and writes a
+filesystem-only snapshot of the preflight run set instead of leaving the marker
+without a shutdown snapshot.
 
 The request command records the preflight set of running heartbeat IDs and writes
 an instance-scoped marker plus a PID-targeted legacy home-root handoff marker.
 This lets a previous server version capture its snapshot at the old path while
 the new server correlates that snapshot back to the authoritative instance
 request. If any preflight run ID is absent from the shutdown snapshot, the
-startup report includes it in `lostRunIds`; a missing snapshot therefore cannot
-look like a zero-loss restart.
+replacement server reconstructs that candidate from its fresh database
+connection. A live detached process remains eligible for adoption. A dead or
+server-stdio process is recorded as `server_shutdown_interrupted` and queued for
+retry. Only a failed adoption or failed interruption appears in `lostRunIds`, so
+a missing shutdown-time database connection cannot silently lose every run.
 
 A healthy guarded deploy must compare the report against `/api/health` (`version` or `serverVersion`) and treat any `lostRunIds` entry as a continuity failure that needs recovery before marking deployment complete.
 
@@ -288,6 +294,12 @@ pnpm paperclipai run
 2. `paperclipai doctor` with repair enabled
 3. starts the server when checks pass
 
+When `paperclipai run` starts from a repo checkout and the server import fails with
+`ERR_MODULE_NOT_FOUND` from torn `node_modules`, a broken pnpm store, or stale
+workspace package links, it now attempts a frozen `pnpm install`, reruns the
+workspace-link preflight, verifies `@paperclipai/server` still builds, and then
+retries startup once before surfacing the boot failure.
+
 ## Docker Quickstart (No local Node install)
 
 Build and run Paperclip in Docker:
@@ -333,6 +345,14 @@ Every local install keeps runtime state directly under the selected instance roo
   companies/<company-id>/agents/<agent-id>/codex-home/
                                                    # per-agent codex_local home
 ```
+
+The server writes `logs/server.log`. When the live file would exceed 500,000,000
+bytes, the logging transport closes and renames it, immediately reopens
+`server.log`, and compresses the archive as
+`server.log.<UTC timestamp>[.<collision>].gz`. It retains the five newest
+compressed archives. If shutdown interrupts compression, the uncompressed
+archive is recovered on the next server start while the live log remains
+writable.
 
 `PAPERCLIP_HOME` and `PAPERCLIP_INSTANCE_ID` override the home root and instance id respectively. `paperclipai onboard` echoes the resolved values in its banner (`Local home: <home> | instance: <id> | config: <path>`) so you can confirm where state will land before continuing.
 

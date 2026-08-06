@@ -384,8 +384,11 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     });
   });
 
-  it("clears due monitors that cannot be dispatched and records a skip", async () => {
-    const { issueId } = await seedFixture({ agentStatus: "paused" });
+  it("rearms due monitors after a dispatch deferral without consuming a terminal attempt", async () => {
+    const { issueId, agentId } = await seedFixture({
+      agentStatus: "paused",
+      monitor: { maxAttempts: 1 },
+    });
     const heartbeat = heartbeatService(db);
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 
@@ -393,19 +396,38 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
     expect(result.skipped).toBe(1);
 
-    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
-    expect(issue.monitorNextCheckAt).toBeNull();
-    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
-      status: "cleared",
-      clearReason: "dispatch_skipped",
+    const deferredIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(deferredIssue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:33:30.000Z");
+    expect(deferredIssue.monitorAttemptCount).toBe(0);
+    expect(parseIssueExecutionState(deferredIssue.executionState)?.monitor).toMatchObject({
+      status: "scheduled",
+      attemptCount: 0,
+      maxAttempts: 1,
     });
 
-    const activity = await db
+    const deferredActivity = await db
       .select()
       .from(activityLog)
-      .where(eq(activityLog.entityId, issueId))
-      .then((rows) => rows.map((row) => row.action));
-    expect(activity).toContain("issue.monitor_skipped");
+      .where(eq(activityLog.entityId, issueId));
+    expect(deferredActivity.map((row) => row.action)).toContain("issue.monitor_skipped");
+    expect(deferredActivity.find((row) => row.action === "issue.monitor_skipped")?.details).toMatchObject({
+      attemptedAttemptCount: 1,
+      restoredAttemptCount: 0,
+      terminalAttemptConsumed: false,
+    });
+
+    await db.update(agents).set({ status: "active" }).where(eq(agents.id, agentId));
+    const delivered = await heartbeat.tickTimers(new Date("2026-04-11T12:34:00.000Z"));
+
+    expect(delivered.enqueued).toBe(1);
+    const deliveredIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(deliveredIssue.monitorNextCheckAt).toBeNull();
+    expect(deliveredIssue.monitorAttemptCount).toBe(1);
+    expect(parseIssueExecutionState(deliveredIssue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      attemptCount: 1,
+      maxAttempts: 1,
+    });
   });
 
   it("clears exhausted monitors and queues bounded owner recovery instead of another due check", async () => {
