@@ -251,7 +251,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
 
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
-        const liveWakeIdempotencyHash = await migrationHash("0207_agent_wakeup_live_idempotency.sql");
+        const liveWakeIdempotencyHash = await migrationHash("0209_agent_wakeup_live_idempotency.sql");
 
         await sql.unsafe(`
           DROP INDEX IF EXISTS "agent_wakeup_requests_live_idempotency_uq"
@@ -330,7 +330,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       const pendingState = await inspectMigrations(connectionString);
       expect(pendingState).toMatchObject({
         status: "needsMigrations",
-        pendingMigrations: ["0207_agent_wakeup_live_idempotency.sql"],
+        pendingMigrations: ["0209_agent_wakeup_live_idempotency.sql"],
         reason: "pending-migrations",
       });
 
@@ -361,7 +361,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
           coalesced_count: 1,
         });
         expect(rows[1].status).toBe("coalesced");
-        expect(rows[1].error).toContain("0207_agent_wakeup_live_idempotency.sql coalesced");
+        expect(rows[1].error).toContain("0209_agent_wakeup_live_idempotency.sql coalesced");
 
         const liveRows = await verifySql.unsafe<{ count: string }[]>(`
           SELECT count(*)::text AS count
