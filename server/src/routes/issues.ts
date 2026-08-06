@@ -2360,13 +2360,17 @@ type IssueListInflightEntry = {
 const issueListResponseCache = new Map<string, IssueListCacheEntry>();
 const issueListInflight = new Map<string, IssueListInflightEntry>();
 const issueListActorClientInflight = new Map<string, number>();
+let issueListCacheGeneration = 0;
 
 export function __getIssueListResponseCacheSizeForTests() {
   return issueListResponseCache.size;
 }
 
 export function __clearIssueListResponseCacheForTests() {
+  issueListCacheGeneration += 1;
   issueListResponseCache.clear();
+  issueListInflight.clear();
+  issueListActorClientInflight.clear();
 }
 
 function shortHash(value: string): string {
@@ -2577,6 +2581,7 @@ async function coordinateIssueListGet(input: {
   }
 
   issueListActorClientInflight.set(actorClientKey, actorClientInflight + 1);
+  const cacheGeneration = issueListCacheGeneration;
   const promise = (async () => {
     await input.diagnostics?.onComputeStart?.({
       companyId: input.companyId,
@@ -2594,7 +2599,7 @@ async function coordinateIssueListGet(input: {
 
   try {
     const response = await promise;
-    if (input.allowTtlCache) {
+    if (input.allowTtlCache && cacheGeneration === issueListCacheGeneration) {
       setIssueListResponseCacheEntry(input.requestKey.key, {
         response,
         expiresAt: Date.now() + ISSUE_LIST_SERVER_CACHE_TTL_MS,
