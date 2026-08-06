@@ -4409,7 +4409,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
       const replacement = heartbeatService(db);
       await replacement.resumeQueuedRuns();
-      const settledHandoff = await waitForRunToSettle(replacement, handoffRun.id, 5_000);
+      await replacement.drainActiveRunExecutions();
+      const settledHandoff = await replacement.getRun(handoffRun.id);
       expect(settledHandoff?.status).toBe("succeeded");
       expect(settledHandoff?.errorCode).not.toBe("process_lost");
       const claimedWakeup = await db
