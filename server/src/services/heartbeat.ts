@@ -271,6 +271,7 @@ import {
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
+  LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME,
   readPaperclipSkillSyncPreference,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -356,6 +357,7 @@ const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const ORPHANED_RUN_SILENCE_SWEEP_THRESHOLD_MS = 15 * 60 * 1000;
+const HOT_RESTART_COMPLETION_EVIDENCE_GRACE_MS = 60 * 1000;
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -10363,6 +10365,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
+    if ((run.processLossRetryCount ?? 0) >= 1) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because restart-recovery lineage is exhausted",
+        payload: {
+          processLossRetryCount: run.processLossRetryCount ?? 0,
+          maxProcessLossRetryCount: 1,
+        },
+      });
+      return null;
+    }
+
     const existingRetry = await db
       .select()
       .from(heartbeatRuns)
@@ -10559,15 +10575,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { mode: "pid_mismatch" as const, skipDrain: false as const, activeRunIds: [] as string[] };
     }
 
-    const activeRuns = await db
-      .select({
-        run: heartbeatRuns,
-        adapterType: agents.adapterType,
-        adapterConfig: agents.adapterConfig,
-      })
-      .from(heartbeatRuns)
-      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(eq(heartbeatRuns.status, "running"));
+    let activeRuns: Array<{
+      run: typeof heartbeatRuns.$inferSelect;
+      adapterType: string;
+      adapterConfig: unknown;
+    }>;
+    try {
+      activeRuns = await db
+        .select({
+          run: heartbeatRuns,
+          adapterType: agents.adapterType,
+          adapterConfig: agents.adapterConfig,
+        })
+        .from(heartbeatRuns)
+        .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+        .where(eq(heartbeatRuns.status, "running"));
+    } catch (err) {
+      // The restart request captures running ids before SIGTERM. Preserve that
+      // durable preflight set in a filesystem-only snapshot when the shutdown
+      // database socket is already gone. The replacement server can hydrate
+      // those rows from its fresh connection and adopt or interrupt them.
+      await writeHotRestartShutdownSnapshot({
+        intent: {
+          ...intent,
+          previousServerVersion: intent.previousServerVersion ?? serverVersion,
+        },
+        signal,
+        activeRuns: [],
+        capturedAt: now,
+      });
+      logger.error(
+        {
+          err,
+          signal,
+          previousServerPid: intent.previousServerPid,
+          preflightActiveRunIds: intent.preflightActiveRunIds,
+          resolvedMode: "preflight_snapshot_fallback",
+        },
+        "hot-restart active-run query failed; wrote preflight fallback snapshot",
+      );
+      return {
+        mode: "preflight_snapshot_fallback" as const,
+        skipDrain: true as const,
+        activeRunIds: intent.preflightActiveRunIds,
+      };
+    }
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
@@ -10676,25 +10728,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
         intent.drainRequired
           ? "drain-required restart intent has no adoption snapshot"
-          : "hot-restart intent present but shutdown snapshot is missing; no runs can be adopted",
+          : "hot-restart intent present but shutdown snapshot is missing; reconstructing from preflight runs",
       );
     }
-    const candidates = intent.shutdownSnapshot?.activeRuns ?? [];
+    const snapshotCandidates = intent.shutdownSnapshot?.activeRuns ?? [];
     const missingSnapshotRunIds = findMissingHotRestartSnapshotRunIds(intent);
     const reconciliationRunIds = [
-      ...new Set([...candidates.map((run) => run.runId), ...missingSnapshotRunIds]),
+      ...new Set([...snapshotCandidates.map((run) => run.runId), ...missingSnapshotRunIds]),
     ];
     const currentRows = reconciliationRunIds.length > 0
       ? await db
         .select({
           run: heartbeatRuns,
           adapterType: agents.adapterType,
+          adapterConfig: agents.adapterConfig,
         })
         .from(heartbeatRuns)
         .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
         .where(inArray(heartbeatRuns.id, reconciliationRunIds))
       : [];
     const currentByRunId = new Map(currentRows.map((row) => [row.run.id, row]));
+    const reconstructedCandidateRunIds = new Set(missingSnapshotRunIds);
+    const reconstructedCandidates = missingSnapshotRunIds.flatMap((runId) => {
+      const current = currentByRunId.get(runId);
+      return current ? [toHotRestartIntentRun(current)] : [];
+    });
+    const candidates = [...snapshotCandidates, ...reconstructedCandidates];
 
     const reportRuns: HotRestartReportRun[] = [];
     const adoptedRunIds: string[] = [];
@@ -10717,24 +10776,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
 
     for (const runId of missingSnapshotRunIds) {
-      const current = currentByRunId.get(runId);
-      if (!current) {
-        finalizedWhileDownRunIds.push(runId);
-        continue;
-      }
-
-      const candidate = toHotRestartIntentRun(current);
-      if (current.run.status !== "running") {
-        classify(candidate, "finalized_while_down", `run_status_${current.run.status}`);
-      } else {
-        classify(candidate, "lost", "missing_shutdown_snapshot");
-      }
+      if (!currentByRunId.has(runId)) finalizedWhileDownRunIds.push(runId);
     }
 
-    if (lostRunIds.length > 0) {
-      logger.error(
-        { previousServerPid: intent.previousServerPid, lostRunIds },
-        "hot-restart shutdown snapshot omitted live preflight runs; reporting them as lost",
+    if (reconstructedCandidates.length > 0) {
+      logger.warn(
+        {
+          previousServerPid: intent.previousServerPid,
+          reconstructedRunIds: reconstructedCandidates.map((run) => run.runId),
+        },
+        "reconstructing hot-restart candidates from the preflight active-run set",
       );
     }
 
@@ -10745,7 +10796,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
-      const { run, adapterType } = current;
+      const { run, adapterType, adapterConfig } = current;
       const patch = {
         adapterType,
         status: run.status,
@@ -10756,6 +10807,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (run.status !== "running") {
         classify(candidate, "finalized_while_down", `run_status_${run.status}`, patch);
         continue;
+      }
+
+      if (reconstructedCandidateRunIds.has(run.id)) {
+        const processPid = run.processPid ?? candidate.processPid;
+        const processGroupId = run.processGroupId ?? candidate.processGroupId;
+        const processAlive = isProcessAlive(processPid) || isProcessGroupAlive(processGroupId);
+        const requiresInterrupt = !processAlive || isServerStdioBoundHotRestartRun({
+          run,
+          adapterType,
+          adapterConfig,
+        });
+        if (requiresInterrupt) {
+          const signal = intent.shutdownSnapshot?.signal ?? "SIGTERM";
+          const drain = await drainRunningRunsForShutdown(signal, now, [run.id]);
+          if (drain.interruptedRunIds.includes(run.id)) {
+            classify(candidate, "finalized_while_down", "server_shutdown_interrupted", patch);
+          } else {
+            const latest = await db
+              .select({ status: heartbeatRuns.status })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, run.id))
+              .then((rows) => rows[0] ?? null);
+            if (latest && latest.status !== "running") {
+              classify(candidate, "finalized_while_down", `run_status_${latest.status}`, {
+                ...patch,
+                status: latest.status,
+              });
+            } else {
+              classify(candidate, "lost", "preflight_interrupt_not_applied", patch);
+            }
+          }
+          continue;
+        }
       }
 
       const hasSelectiveAcpDrain = intent.drainReason === "active_acp_run"
@@ -13522,6 +13606,203 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function observeAdoptedRunCompletion(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
+    now: Date,
+    options: { processAlive: boolean },
+  ) {
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    if (!issueId) return null;
+
+    const scratch = parseObject(context.paperclipScratch);
+    const scratchDir = readNonEmptyString(scratch.dir);
+    const terminalEnvelope: Record<string, unknown> = scratchDir
+      ? await fs.readFile(path.join(scratchDir, LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME), "utf8")
+        .then((raw) => parseObject(JSON.parse(raw)))
+        .catch(() => ({}))
+      : {};
+    const terminalEnvelopeRunId = readNonEmptyString(terminalEnvelope.runId);
+    const terminalEnvelopeCompletedAt = readNonEmptyString(terminalEnvelope.completedAt);
+    const terminalEnvelopeSignal = readNonEmptyString(terminalEnvelope.signal);
+    const terminalEnvelopeError = readNonEmptyString(terminalEnvelope.errorMessage);
+    const terminalEnvelopeExitCode = typeof terminalEnvelope.exitCode === "number" &&
+      Number.isInteger(terminalEnvelope.exitCode)
+      ? terminalEnvelope.exitCode
+      : null;
+    const hasTerminalEnvelope = terminalEnvelope.version === 1 &&
+      terminalEnvelopeRunId === run.id &&
+      Boolean(terminalEnvelopeCompletedAt) &&
+      (terminalEnvelopeExitCode !== null || terminalEnvelopeSignal !== null || terminalEnvelopeError !== null);
+
+    const [issue, completionComment] = await Promise.all([
+      db
+        .select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: issueComments.id, body: issueComments.body, createdAt: issueComments.createdAt })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.companyId, run.companyId),
+          eq(issueComments.createdByRunId, run.id),
+          isNull(issueComments.deletedAt),
+        ))
+        .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    const existingResultJson = parseObject(run.resultJson);
+    const existingEnvelope = parseObject(existingResultJson.hotRestartCompletion);
+    const existingEnvelopeIssueId = readNonEmptyString(existingEnvelope.issueId);
+    const existingIssueStatus = existingEnvelopeIssueId === issueId &&
+      (existingEnvelope.issueStatus === "done" || existingEnvelope.issueStatus === "cancelled")
+      ? existingEnvelope.issueStatus
+      : null;
+    const issueStatus = issue &&
+      (issue.executionRunId === null || issue.executionRunId === run.id) &&
+      (issue.status === "done" || issue.status === "cancelled")
+      ? issue.status
+      : existingIssueStatus;
+    const existingCommentId = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.commentId)
+      : null;
+    const existingCommentBody = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.commentBody)
+      : null;
+    const existingCommentCreatedAt = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.commentCreatedAt)
+      : null;
+    const commentId = completionComment?.id ?? existingCommentId;
+    const commentBody = completionComment?.body ?? existingCommentBody;
+    const commentCreatedAt = completionComment?.createdAt.toISOString() ?? existingCommentCreatedAt;
+    const existingProcessExitedAt = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.processExitedAt)
+      : null;
+    const processExitedAt = options.processAlive ? existingProcessExitedAt : (existingProcessExitedAt ?? now.toISOString());
+    const existingObservedAt = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.observedAt)
+      : null;
+    const observedAt = existingObservedAt ?? now.toISOString();
+    const hasCompleteIssueEvidence = Boolean(issueStatus && commentId && commentBody);
+    const hasCompleteTerminalEvidence = hasTerminalEnvelope || hasCompleteIssueEvidence;
+    const envelope = {
+      version: 1,
+      state: hasCompleteTerminalEvidence && !options.processAlive
+        ? "completed"
+        : "awaiting_terminal_evidence",
+      observed: hasCompleteTerminalEvidence && !options.processAlive,
+      observedAt,
+      updatedAt: now.toISOString(),
+      processExitedAt,
+      issueId,
+      issueStatus,
+      commentId,
+      commentBody,
+      commentCreatedAt,
+      childCompletion: hasTerminalEnvelope ? {
+        completedAt: terminalEnvelopeCompletedAt,
+        exitCode: terminalEnvelopeExitCode,
+        signal: terminalEnvelopeSignal,
+        errorMessage: terminalEnvelopeError,
+      } : null,
+      evidence: hasCompleteTerminalEvidence
+        ? hasTerminalEnvelope
+          ? "run_attributed_child_completion_envelope"
+          : "run_attributed_terminal_issue_disposition"
+        : "partial_run_attributed_terminal_issue_evidence",
+    };
+    const envelopeResultJson = {
+      ...existingResultJson,
+      hotRestartCompletion: envelope,
+    };
+    const persistedEnvelope = await db
+      .update(heartbeatRuns)
+      .set({ resultJson: envelopeResultJson, updatedAt: now })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!persistedEnvelope) return null;
+
+    if (!hasCompleteTerminalEvidence || options.processAlive) {
+      const exitObservedAtMs = processExitedAt ? new Date(processExitedAt).getTime() : Number.NaN;
+      const retryEligible = Number.isFinite(exitObservedAtMs) &&
+        now.getTime() - exitObservedAtMs >= HOT_RESTART_COMPLETION_EVIDENCE_GRACE_MS;
+      return {
+        state: "pending" as const,
+        run: persistedEnvelope,
+        retryEligible,
+      };
+    }
+
+    const status = issueStatus === "cancelled" || terminalEnvelopeSignal === "SIGTERM" || terminalEnvelopeSignal === "SIGINT"
+      ? "cancelled"
+      : terminalEnvelopeExitCode === 0 || issueStatus === "done"
+        ? "succeeded"
+        : "failed";
+    const summary = commentBody ?? (
+      status === "succeeded"
+        ? "Adopted local child completed successfully."
+        : status === "cancelled"
+          ? `Adopted local child was cancelled${terminalEnvelopeSignal ? ` by ${terminalEnvelopeSignal}` : ""}.`
+          : terminalEnvelopeError ?? `Adopted local child exited with code ${terminalEnvelopeExitCode ?? "unknown"}.`
+    );
+    const resultJson = mergeRunStopMetadataForAgent(agent, status, {
+      resultJson: {
+        ...envelopeResultJson,
+        summary,
+      },
+    });
+    const finalized = await setRunStatusIfRunning(run.id, status, {
+      finishedAt: now,
+      error: status === "failed" ? summary : null,
+      errorCode: status === "failed" ? "adapter_failed" : null,
+      exitCode: terminalEnvelopeExitCode,
+      signal: terminalEnvelopeSignal,
+      resultJson,
+    });
+    if (!finalized.updated || !finalized.run) return null;
+
+    let finalizedRun = finalized.run;
+    await setWakeupStatus(
+      run.wakeupRequestId,
+      status === "succeeded" ? "completed" : status,
+      {
+      finishedAt: now,
+      error: status === "failed" ? summary : null,
+      },
+    );
+    finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, resultJson) ?? finalizedRun;
+    await releaseEnvironmentLeasesForRun({
+      runId: finalizedRun.id,
+      companyId: finalizedRun.companyId,
+      agentId: finalizedRun.agentId,
+      status: finalizedRun.status,
+      failureReason: undefined,
+    });
+    await releaseIssueExecutionAndPromote(finalizedRun);
+    await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Finalized adopted child from durable run-attributed terminal evidence",
+      payload: {
+        issueId,
+        issueStatus,
+        commentId,
+        evidence: envelope.evidence,
+      },
+    });
+    await finalizeAgentStatus(run.agentId, status, status === "failed" ? summary : null, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
+    return { state: "finalized" as const, run: finalizedRun, retryEligible: false };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; now?: Date }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = opts?.now ?? new Date();
@@ -13582,8 +13863,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const { run, adapterType, adapterConfig, agentStatus } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
+      const hotRestartAdoption = readHotRestartAdoptionMetadata(parseObject(run.resultJson));
+
       // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
+      // Hot-restart adoption cannot restore the previous server's in-memory
+      // child handle or exit callback. Poll those rows immediately so a child
+      // that exits after adoption is interrupted and retried instead of sitting
+      // in running until the generic process-lost threshold expires.
+      if (!hotRestartAdoption && staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
@@ -13642,11 +13929,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const processGroupAlive = Boolean(
         tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId),
       );
-      if (
-        (processPidAlive || processGroupAlive) &&
-        readHotRestartAdoptionMetadata(parseObject(run.resultJson))
-      ) {
-        continue;
+      if (hotRestartAdoption) {
+        const completion = await observeAdoptedRunCompletion(
+          run,
+          { adapterType, adapterConfig },
+          now,
+          { processAlive: processPidAlive || processGroupAlive },
+        );
+        if (completion?.state === "finalized") {
+          logger.info(
+            {
+              runId: run.id,
+              status: completion.run.status,
+              adoptedAt: hotRestartAdoption.adoptedAt,
+            },
+            "hot-restart adopted child completion observed under original run identity",
+          );
+          continue;
+        }
+        if (completion && !completion.retryEligible) continue;
+        const recovery = await drainRunningRunsForShutdown("SIGTERM", now, [run.id]);
+        if (recovery.interruptedRunIds.includes(run.id)) {
+          logger.warn(
+            {
+              runId: run.id,
+              processPid: run.processPid ?? null,
+              processGroupId: run.processGroupId ?? null,
+              adoptedAt: hotRestartAdoption.adoptedAt,
+              retryRunIds: recovery.retryRunIds,
+            },
+            "hot-restart adopted child exited without a recoverable completion observer; interrupted run and queued retry",
+          );
+          continue;
+        }
       }
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
@@ -18403,6 +18718,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (activeExecutionRun) {
+          const foldDuplicateLiveWake = async () => {
+            if (!opts.idempotencyKey) return false;
+            const folded = await tx
+              .update(agentWakeupRequests)
+              .set({
+                coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, agent.companyId),
+                  eq(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+                  inArray(agentWakeupRequests.status, [
+                    "queued",
+                    "claimed",
+                    "completed",
+                    "deferred_issue_execution",
+                  ]),
+                ),
+              )
+              .returning({ id: agentWakeupRequests.id })
+              .then((rows) => rows[0] ?? null);
+            return Boolean(folded);
+          };
           const executionAgent = await tx
             .select({ name: agents.name })
             .from(agents)
@@ -18447,6 +18787,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .returning()
               .then((rows) => rows[0] ?? availableActiveExecutionRun);
 
+            if (await foldDuplicateLiveWake()) {
+              return { kind: "duplicate" as const };
+            }
             await tx.insert(agentWakeupRequests).values({
               companyId: agent.companyId,
               agentId,

@@ -149,16 +149,40 @@ export type ServerShutdownSequenceInput = {
   exitProcess: (code: number) => never;
 };
 
+export async function drainHeartbeatRunsWithShutdownLogging(input: {
+  signal: "SIGINT" | "SIGTERM";
+  drainHeartbeatRunsForShutdown: (signal: "SIGINT" | "SIGTERM") => Promise<unknown>;
+}) {
+  try {
+    const drain = await input.drainHeartbeatRunsForShutdown(input.signal);
+    logger.info({ signal: input.signal, drain }, "graceful heartbeat run drain complete");
+    return drain;
+  } catch (err) {
+    logger.error({ err, signal: input.signal }, "graceful heartbeat run drain failed");
+    return null;
+  }
+}
+
+export async function stopEmbeddedPostgresWithShutdownLogging(input: {
+  signal: "SIGINT" | "SIGTERM";
+  stopEmbeddedPostgres: () => Promise<void>;
+}) {
+  logger.info({ signal: input.signal }, "Stopping embedded PostgreSQL");
+  try {
+    await input.stopEmbeddedPostgres();
+  } catch (err) {
+    logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
+  }
+}
+
 export async function runServerShutdownSequence(input: ServerShutdownSequenceInput): Promise<never> {
   input.stopHeartbeatScheduler();
 
   if (input.drainHeartbeatRunsForShutdown) {
-    try {
-      const drain = await input.drainHeartbeatRunsForShutdown(input.signal);
-      logger.info({ signal: input.signal, drain }, "graceful heartbeat run drain complete");
-    } catch (err) {
-      logger.error({ err, signal: input.signal }, "graceful heartbeat run drain failed");
-    }
+    await drainHeartbeatRunsWithShutdownLogging({
+      signal: input.signal,
+      drainHeartbeatRunsForShutdown: input.drainHeartbeatRunsForShutdown,
+    });
   }
 
   await input.waitForHeartbeatSchedulerIdle();
@@ -167,12 +191,10 @@ export async function runServerShutdownSequence(input: ServerShutdownSequenceInp
   input.appShutdown?.();
 
   if (input.stopEmbeddedPostgres) {
-    logger.info({ signal: input.signal }, "Stopping embedded PostgreSQL");
-    try {
-      await input.stopEmbeddedPostgres();
-    } catch (err) {
-      logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
-    }
+    await stopEmbeddedPostgresWithShutdownLogging({
+      signal: input.signal,
+      stopEmbeddedPostgres: input.stopEmbeddedPostgres,
+    });
   }
 
   // Flush buffered OTel spans before the process goes away; without this
@@ -963,10 +985,11 @@ export async function startServer(): Promise<StartedServer> {
     port: listenPort,
   });
   const inheritedApiUrl = process.env.PAPERCLIP_API_URL?.trim();
+  const publicApiUrl = normalizeUrlToOrigin(config.authPublicBaseUrl ?? undefined);
   const configuredApiUrl =
     inheritedApiUrl && shouldRewriteConfiguredApiUrlForRuntimePort(inheritedApiUrl, runtimeListenHost)
       ? normalizeUrlToOrigin(rewriteLocalUrlPort(inheritedApiUrl, listenPort)) ?? runtimeApiUrl
-      : inheritedApiUrl || runtimeApiUrl;
+      : inheritedApiUrl || publicApiUrl || runtimeApiUrl;
   const runtimeApiCandidates = buildRuntimeApiCandidateUrls({
     preferredApiUrl: configuredApiUrl,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
@@ -1571,17 +1594,22 @@ export async function startServer(): Promise<StartedServer> {
         prepareHotRestartShutdown,
         waitForHeartbeatSchedulerIdle,
       });
+      if (heartbeatShutdown.preparationError) {
+        logger.error(
+          {
+            err: heartbeatShutdown.preparationError,
+            signal,
+            resolvedMode: "graceful_drain",
+          },
+          "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
+        );
+      }
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
       const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
       if (skipHeartbeatDrain) {
         logger.info(
           { signal, hotRestart: heartbeatShutdown.hotRestart },
           "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
-        );
-      } else if (heartbeatShutdown.preparationError) {
-        logger.error(
-          { err: heartbeatShutdown.preparationError, signal },
-          "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
         );
       }
 
@@ -1591,18 +1619,22 @@ export async function startServer(): Promise<StartedServer> {
         await telemetryClient.flush();
       }
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-        try {
-          const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-          logger.info({ signal, drain }, "graceful heartbeat run drain complete");
-        } catch (err) {
-          logger.error({ err, signal }, "graceful heartbeat run drain failed");
-        }
+        await drainHeartbeatRunsWithShutdownLogging({
+          signal,
+          drainHeartbeatRunsForShutdown: (drainSignal) =>
+            drainHeartbeatRunsForShutdown(drainSignal, selectiveDrainRunIds),
+        });
       }
       await flushInFlightRunLogMirrors().catch((err) => {
         logger.error({ err, signal }, "run-log in-flight mirror flush failed");
       });
       (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown?.();
-      if (embeddedPostgres && embeddedPostgresStartedByThisProcess) await embeddedPostgres.stop();
+      if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
+        await stopEmbeddedPostgresWithShutdownLogging({
+          signal,
+          stopEmbeddedPostgres: () => embeddedPostgres.stop(),
+        });
+      }
       await shutdownInstrumentation();
       process.exit(0);
     };

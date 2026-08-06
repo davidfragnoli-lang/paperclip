@@ -40,5 +40,10 @@ export const agentWakeupRequests = pgTable(
     reviewPathRecoveryIdempotencyUq: uniqueIndex("agent_wakeup_requests_review_path_recovery_idempotency_uq")
       .on(table.companyId, table.idempotencyKey)
       .where(sql`${table.idempotencyKey} LIKE 'issue_review_path_lost:%' AND ${table.status} <> 'skipped'`),
+    liveIdempotencyUq: uniqueIndex("agent_wakeup_requests_live_idempotency_uq")
+      .on(table.companyId, table.agentId, table.idempotencyKey)
+      .where(
+        sql`${table.idempotencyKey} is not null and ${table.status} in ('queued', 'claimed', 'completed', 'deferred_issue_execution')`,
+      ),
   }),
 );
