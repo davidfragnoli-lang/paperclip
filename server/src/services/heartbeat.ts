@@ -6747,7 +6747,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // claim that new row: it would be absent from the snapshot and could exit
   // before the adapter records a pid, lease, or log. Keep the queue write
   // enabled and pause only this service instance's claims so the replacement
-  // server can resume the queued row during startup recovery.
+  // server can resume the queued row during startup recovery. Every invocation
+  // source (timer, assignment, on_demand, and automation) claims through
+  // startNextQueuedRunForAgent, so none can bypass this service-wide gate.
   let runDispatchQuiescedForShutdown = false;
   const quiesceRunDispatchForShutdown = () => {
     runDispatchQuiescedForShutdown = true;
