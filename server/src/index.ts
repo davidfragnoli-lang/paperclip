@@ -1564,13 +1564,17 @@ export async function startServer(): Promise<StartedServer> {
         signal,
         prepareHotRestartShutdown,
         waitForHeartbeatSchedulerIdle,
-        reportPreparationError: (err, context) => {
-          logger.error(
-            { err, ...context },
-            "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
-          );
-        },
       });
+      if (heartbeatShutdown.preparationError) {
+        logger.error(
+          {
+            err: heartbeatShutdown.preparationError,
+            signal,
+            resolvedMode: "graceful_drain",
+          },
+          "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
+        );
+      }
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
       const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
       if (skipHeartbeatDrain) {
