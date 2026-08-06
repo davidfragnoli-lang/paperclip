@@ -4235,6 +4235,107 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
   });
 
+  it("leaves a successful-run handoff queued for the replacement server when it is created after the shutdown snapshot", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture({
+      adapterType: "codex_local",
+      adapterConfig: { engine: "cli" },
+    });
+    let releaseSourceRun!: () => void;
+    const sourceRunCanFinish = new Promise<void>((resolve) => {
+      releaseSourceRun = resolve;
+    });
+    let sourceRunStarted!: () => void;
+    const sourceRunIsRunning = new Promise<void>((resolve) => {
+      sourceRunStarted = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      sourceRunStarted();
+      await sourceRunCanFinish;
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Finished the implementation during shutdown without choosing a final issue state.",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Finished the implementation during shutdown without choosing a final issue state.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await withTempPaperclipHome(async () => {
+      const outgoing = heartbeatService(db);
+      await outgoing.resumeQueuedRuns();
+      await sourceRunIsRunning;
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "outgoing-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+
+      const prepared = await outgoing.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+      expect(prepared).toMatchObject({
+        mode: "hot_restart",
+        skipDrain: true,
+        activeRunIds: [runId],
+      });
+
+      releaseSourceRun();
+      await outgoing.drainActiveRunExecutions();
+
+      const handoffWakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.reason, "finish_successful_run_handoff"),
+        ))
+        .then((rows) => rows[0] ?? null);
+      expect(handoffWakeup).toMatchObject({ status: "queued" });
+      if (!handoffWakeup?.runId) throw new Error("Expected a durable successful-run handoff wake");
+
+      const handoffRun = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, handoffWakeup.runId))
+        .then((rows) => rows[0] ?? null);
+      expect(handoffRun).toMatchObject({
+        status: "queued",
+        processPid: null,
+        processGroupId: null,
+        logStore: null,
+        logRef: null,
+      });
+      if (!handoffRun) throw new Error("Expected a queued successful-run handoff run");
+      const outgoingLeases = await db
+        .select()
+        .from(environmentLeases)
+        .where(eq(environmentLeases.heartbeatRunId, handoffRun.id));
+      expect(outgoingLeases).toHaveLength(0);
+
+      const replacement = heartbeatService(db);
+      await replacement.resumeQueuedRuns();
+      const settledHandoff = await waitForRunToSettle(replacement, handoffRun.id, 5_000);
+      expect(settledHandoff?.status).toBe("succeeded");
+      expect(settledHandoff?.errorCode).not.toBe("process_lost");
+      const claimedWakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, handoffWakeup.id))
+        .then((rows) => rows[0] ?? null);
+      expect(claimedWakeup?.status).toBe("completed");
+    });
+  });
+
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const idempotencyKey = `finish_successful_run_handoff:${issueId}:${runId}:1`;
