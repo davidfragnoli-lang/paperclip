@@ -6727,6 +6727,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return override.allowed ? override.cutoff : null;
   };
 
+  // Shutdown snapshots are point-in-time. A run that finishes after the
+  // snapshot can still enqueue durable follow-up work (for example the
+  // successful-run disposition handoff), but the outgoing server must not
+  // claim that new row: it would be absent from the snapshot and could exit
+  // before the adapter records a pid, lease, or log. Keep the queue write
+  // enabled and pause only this service instance's claims so the replacement
+  // server can resume the queued row during startup recovery.
+  let runDispatchQuiescedForShutdown = false;
+  const quiesceRunDispatchForShutdown = () => {
+    runDispatchQuiescedForShutdown = true;
+  };
+
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
@@ -10565,6 +10577,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function prepareHotRestartShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
+    quiesceRunDispatchForShutdown();
+
     let intent: Awaited<ReturnType<typeof readHotRestartIntent>>;
     try {
       intent = await readHotRestartIntent();
@@ -14256,6 +14270,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
+    if (runDispatchQuiescedForShutdown) return [];
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
 
@@ -19873,6 +19888,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reportRunActivity: clearDetachedRunWarning,
 
+    quiesceRunDispatchForShutdown,
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
