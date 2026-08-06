@@ -1516,6 +1516,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
       processPid: child.pid ?? null,
       processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
     });
 
     await withTempPaperclipHome(async () => {
@@ -2183,6 +2187,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runStatus: "queued",
       processPid: null,
       processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
       includeIssue: false,
     });
     const heartbeat = heartbeatService(db);
@@ -2265,6 +2273,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
       processPid: child.pid ?? null,
       processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
     });
 
     await withTempPaperclipHome(async (home) => {
@@ -2333,6 +2345,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
       processPid: orphan.processPid,
       processGroupId: orphan.processGroupId,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
     });
 
     await withTempPaperclipHome(async () => {

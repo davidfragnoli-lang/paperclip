@@ -77,7 +77,10 @@ import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
 import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
-import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
+import {
+  coordinateHeartbeatSchedulerShutdown,
+  loadWithoutCoordinatedShutdownSignalHooks,
+} from "./shutdown.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
 import {
@@ -445,7 +448,13 @@ export async function startServer(): Promise<StartedServer> {
     const moduleName = "embedded-postgres";
     let EmbeddedPostgres: EmbeddedPostgresCtor;
     try {
-      const mod = await import(moduleName);
+      // embedded-postgres registers async-exit-hook handlers as an import side
+      // effect. Those handlers stop PostgreSQL immediately on SIGINT/SIGTERM,
+      // racing Paperclip's later heartbeat snapshot query. Paperclip explicitly
+      // stops the managed cluster in its own ordered shutdown path instead.
+      const mod = await loadWithoutCoordinatedShutdownSignalHooks(
+        () => import(moduleName),
+      );
       EmbeddedPostgres = mod.default as EmbeddedPostgresCtor;
     } catch {
       throw new Error(
@@ -1050,8 +1059,14 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
-  let drainHeartbeatRunsForShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<unknown>) | null = null;
-  let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{ skipDrain: boolean }>) | null = null;
+  let drainHeartbeatRunsForShutdown: ((
+    signal: "SIGINT" | "SIGTERM",
+    runIds?: readonly string[] | null,
+  ) => Promise<unknown>) | null = null;
+  let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
+    skipDrain: boolean;
+    drainRunIds?: string[];
+  }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   let shouldRunPrimaryHeartbeatStartupRecovery = false;
@@ -1098,7 +1113,9 @@ export async function startServer(): Promise<StartedServer> {
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
     });
-    drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
+    drainHeartbeatRunsForShutdown = (signal, runIds) => (
+      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
+    );
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
@@ -1269,10 +1286,10 @@ export async function startServer(): Promise<StartedServer> {
     await runRetentionSweep();
 
     startHeartbeatSchedulerInterval(() => {
-      // Async so the suppression checks below can honor the override-aware
-      // resolver (e.g. worktree run-execution opt-in). The gated work is still
-      // wrapped in trackHeartbeatSchedulerWork with its own error handling.
-      void (async () => {
+      // Track the outer async callback as well as the work it starts. Shutdown
+      // can then wait through an already-running suppression check before it
+      // captures the authoritative set of running heartbeat rows.
+      trackHeartbeatSchedulerWork((async () => {
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
@@ -1409,7 +1426,9 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "periodic heartbeat recovery failed");
             }));
         }
-      })();
+      })().catch((err) => {
+        logger.error({ err }, "heartbeat scheduler tick failed");
+      }));
     });
   } else {
     startHeartbeatSchedulerInterval(() => {
