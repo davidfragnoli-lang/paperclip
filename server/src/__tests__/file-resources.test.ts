@@ -1366,77 +1366,43 @@ describeEmbeddedPostgres("workspace file resources", () => {
     expect(first.headers["content-disposition"]).toBe('attachment; filename="slow-download.bin"');
     expect(Buffer.compare(first.body as Buffer, Buffer.from("slow"))).toBe(0);
   });
+});
 
-  it("uses tighter list-specific rate and concurrency limits", async () => {
-    const { projectRoot, executionRoot } = await makeWorkspace();
-    const graph = await seedGraph(db, { projectRoot, executionRoot });
-    let releaseSlowList: (() => void) | null = null;
-    let slowListStarted: (() => void) | null = null;
-    const slowList = new Promise<void>((resolve) => {
-      releaseSlowList = resolve;
+describe("file resource list limiter", () => {
+  it("uses tighter list-specific rate and concurrency limits", () => {
+    const limiter = createFileResourceListLimiter({
+      maxConcurrent: 1,
+      maxRequests: 2,
+      windowMs: 60_000,
     });
-    const listStarted = new Promise<void>((resolve) => {
-      slowListStarted = resolve;
-    });
-    const service: WorkspaceFileResourceService = {
-      getIssue: vi.fn(async () => ({ companyId: graph.companyId })),
-      list: vi.fn(async () => {
-        slowListStarted?.();
-        await slowList;
-        return {
-          kind: "workspace_file_list",
-          state: "available",
-          workspace: {
-            provider: "local_fs",
-            workspaceLabel: "Workspace",
-            workspaceKind: "project_workspace",
-            workspaceId: "11111111-1111-4111-8111-111111111111",
-          },
-          query: {
-            workspace: "auto",
-            mode: "all",
-            q: null,
-            limit: 25,
-          },
-          items: [],
-          scannedCount: 0,
-          truncated: false,
-        };
-      }),
-      resolve: vi.fn(async () => {
-        throw new Error("not used");
-      }),
-      readContent: vi.fn(async () => {
-        throw new Error("not used");
-      }),
-      prepareDownload: vi.fn(async () => {
-        throw new Error("not used");
-      }),
-    };
-    const app = createApp(
-      db,
-      {
-        type: "board",
-        userId: "board-user",
-        companyIds: [graph.companyId],
-        source: "session",
-        isInstanceAdmin: false,
-      },
-      {
-        service,
-        listLimiter: createFileResourceListLimiter({ maxConcurrent: 1, maxRequests: 2, windowMs: 60_000 }),
-      },
-    );
+    const key = "company:board-user:issue";
+    const release = limiter.acquire(key);
 
-    const first = request(app).get(`/api/issues/${graph.issueId}/file-resources/list`);
-    const firstResponse = first.then((res) => res);
-    await listStarted;
-    const second = await request(app).get(`/api/issues/${graph.issueId}/file-resources/list`);
-    expect(second.status).toBe(429);
-    releaseSlowList?.();
-    expect((await firstResponse).status).toBe(200);
-    const third = await request(app).get(`/api/issues/${graph.issueId}/file-resources/list`);
-    expect(third.status).toBe(429);
+    let concurrencyError: unknown;
+    try {
+      limiter.acquire(key);
+    } catch (error) {
+      concurrencyError = error;
+    }
+    expect(concurrencyError).toMatchObject({
+      status: 429,
+      message: "Too many concurrent workspace file list requests",
+      details: { code: "concurrency_limited" },
+    });
+
+    release();
+
+    let rateError: unknown;
+    try {
+      limiter.acquire(key);
+    } catch (error) {
+      rateError = error;
+    }
+    expect(rateError).toMatchObject({
+      status: 429,
+      message: "Too many workspace file list requests",
+      details: { code: "rate_limited" },
+    });
   });
 });
 
