@@ -13569,8 +13569,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const { run, adapterType, adapterConfig, agentStatus } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
+      const hotRestartAdoption = readHotRestartAdoptionMetadata(parseObject(run.resultJson));
+
       // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
+      // Hot-restart adoption cannot restore the previous server's in-memory
+      // child handle or exit callback. Poll those rows immediately so a child
+      // that exits after adoption is interrupted and retried instead of sitting
+      // in running until the generic process-lost threshold expires.
+      if (!hotRestartAdoption && staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
@@ -13631,9 +13637,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
       if (
         (processPidAlive || processGroupAlive) &&
-        readHotRestartAdoptionMetadata(parseObject(run.resultJson))
+        hotRestartAdoption
       ) {
         continue;
+      }
+      if (hotRestartAdoption) {
+        const recovery = await drainRunningRunsForShutdown("SIGTERM", now, [run.id]);
+        if (recovery.interruptedRunIds.includes(run.id)) {
+          logger.warn(
+            {
+              runId: run.id,
+              processPid: run.processPid ?? null,
+              processGroupId: run.processGroupId ?? null,
+              adoptedAt: hotRestartAdoption.adoptedAt,
+              retryRunIds: recovery.retryRunIds,
+            },
+            "hot-restart adopted child exited without a recoverable completion observer; interrupted run and queued retry",
+          );
+          continue;
+        }
       }
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {

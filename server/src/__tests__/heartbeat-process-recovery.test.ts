@@ -2337,6 +2337,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("interrupts and retries an adopted run when its detached child exits after hot restart", async () => {
+    const adoptedAt = new Date("2026-03-19T00:07:00.000Z");
+    const reapedAt = new Date("2026-03-19T00:07:01.000Z");
+    const { agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: 999_999_999,
+      now: adoptedAt,
+      updatedAt: adoptedAt,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          hotRestart: {
+            adopted: true,
+            adoptedAt: adoptedAt.toISOString(),
+            previousServerPid: 101,
+            newServerPid: 202,
+            previousServerVersion: "old-version",
+            newServerVersion: "new-version",
+            processPid: 999_999_999,
+            processGroupId: null,
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns({
+      staleThresholdMs: 5 * 60 * 1000,
+      now: reapedAt,
+    });
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const interruptedRun = runs.find((row) => row.id === runId);
+    const retryRun = runs.find((row) => row.retryOfRunId === runId);
+    expect(interruptedRun).toMatchObject({
+      status: "interrupted",
+      errorCode: "server_shutdown_interrupted",
+      signal: "SIGTERM",
+    });
+    expect(interruptedRun?.resultJson).toMatchObject({
+      hotRestart: {
+        adopted: true,
+        adoptedAt: adoptedAt.toISOString(),
+      },
+      stopReason: "interrupted",
+    });
+    expect(retryRun).toMatchObject({
+      status: "queued",
+      retryOfRunId: runId,
+      processLossRetryCount: 1,
+    });
+  });
+
   it.skipIf(process.platform === "win32")("keeps process-group-only hot-restart adoptions out of process_lost reaping", async () => {
     const orphan = await spawnOrphanedProcessGroup();
     cleanupPids.add(orphan.descendantPid);
