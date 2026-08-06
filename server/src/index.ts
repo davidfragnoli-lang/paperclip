@@ -1089,6 +1089,7 @@ export async function startServer(): Promise<StartedServer> {
     skipDrain: boolean;
     drainRunIds?: string[];
   }>) | null = null;
+  let quiesceHeartbeatRunDispatchForShutdown: (() => void) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   let shouldRunPrimaryHeartbeatStartupRecovery = false;
@@ -1139,6 +1140,7 @@ export async function startServer(): Promise<StartedServer> {
       heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
     );
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
+    quiesceHeartbeatRunDispatchForShutdown = heartbeat.quiesceRunDispatchForShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
     const tools = toolAccessService(db as any, {
@@ -1577,6 +1579,7 @@ export async function startServer(): Promise<StartedServer> {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
+      quiesceHeartbeatRunDispatchForShutdown?.();
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
