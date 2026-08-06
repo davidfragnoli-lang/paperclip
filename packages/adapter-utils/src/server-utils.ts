@@ -2051,6 +2051,10 @@ export function buildPaperclipEnv(agent: { id: string; companyId: string }): Rec
     process.env.PAPERCLIP_API_URL ??
     `http://${runtimeHost}:${runtimePort}`;
   vars.PAPERCLIP_API_URL = apiUrl;
+  const runtimeApiCandidates = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON?.trim();
+  if (runtimeApiCandidates) {
+    vars.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = runtimeApiCandidates;
+  }
   return vars;
 }
 
