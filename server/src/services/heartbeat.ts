@@ -10831,7 +10831,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
-      if (reconstructedCandidateRunIds.has(run.id)) {
+      const snapshottedLocalDispatchNeverSpawned =
+        !reconstructedCandidateRunIds.has(run.id) &&
+        isTrackedLocalChildProcessAdapter(adapterType) &&
+        !(run.processPid ?? candidate.processPid) &&
+        !(run.processGroupId ?? candidate.processGroupId);
+      if (reconstructedCandidateRunIds.has(run.id) || snapshottedLocalDispatchNeverSpawned) {
         const processPid = run.processPid ?? candidate.processPid;
         const processGroupId = run.processGroupId ?? candidate.processGroupId;
         const processAlive = isProcessAlive(processPid) || isProcessGroupAlive(processGroupId);

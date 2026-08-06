@@ -1583,6 +1583,81 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("interrupts and retries a snapshotted run that never recorded process metadata", async () => {
+    const { agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async (home) => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "pre-spawn-dispatch-version",
+        requestedAt: new Date("2026-08-06T09:42:00.000Z"),
+        preflightActiveRunIds: [runId],
+      });
+      const outgoing = heartbeatService(db);
+
+      await expect(outgoing.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-08-06T09:43:14.000Z"),
+      )).resolves.toEqual({
+        mode: "hot_restart",
+        skipDrain: true,
+        activeRunIds: [runId],
+      });
+      await expect(readHotRestartIntent()).resolves.toMatchObject({
+        shutdownSnapshot: {
+          activeRuns: [expect.objectContaining({
+            runId,
+            processPid: null,
+            processGroupId: null,
+          })],
+        },
+      });
+
+      const replacement = heartbeatService(db);
+      const adoption = await replacement.reconcileHotRestartAdoption(
+        new Date("2026-08-06T09:43:15.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [],
+        finalizedWhileDownRunIds: [runId],
+        lostRunIds: [],
+        skippedRunIds: [],
+      });
+
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.find((run) => run.id === runId)).toMatchObject({
+        status: "interrupted",
+        errorCode: "server_shutdown_interrupted",
+        processPid: null,
+        processGroupId: null,
+      });
+      expect(runs.find((run) => run.retryOfRunId === runId)).toMatchObject({
+        status: "queued",
+      });
+
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as { runs: Array<{ runId: string; classification: string; reason: string }> };
+      expect(report.runs).toContainEqual(expect.objectContaining({
+        runId,
+        classification: "finalized_while_down",
+        reason: "server_shutdown_interrupted",
+      }));
+    });
+  });
+
   it("writes a preflight fallback snapshot when the shutdown database query fails", async () => {
     const { runId } = await seedRunFixture({
       agentStatus: "running",
