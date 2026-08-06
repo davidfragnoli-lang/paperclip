@@ -262,6 +262,7 @@ import {
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
+  LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME,
   readPaperclipSkillSyncPreference,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -13534,6 +13535,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const issueId = readNonEmptyString(context.issueId);
     if (!issueId) return null;
 
+    const scratch = parseObject(context.paperclipScratch);
+    const scratchDir = readNonEmptyString(scratch.dir);
+    const terminalEnvelope: Record<string, unknown> = scratchDir
+      ? await fs.readFile(path.join(scratchDir, LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME), "utf8")
+        .then((raw) => parseObject(JSON.parse(raw)))
+        .catch(() => ({}))
+      : {};
+    const terminalEnvelopeRunId = readNonEmptyString(terminalEnvelope.runId);
+    const terminalEnvelopeCompletedAt = readNonEmptyString(terminalEnvelope.completedAt);
+    const terminalEnvelopeSignal = readNonEmptyString(terminalEnvelope.signal);
+    const terminalEnvelopeError = readNonEmptyString(terminalEnvelope.errorMessage);
+    const terminalEnvelopeExitCode = typeof terminalEnvelope.exitCode === "number" &&
+      Number.isInteger(terminalEnvelope.exitCode)
+      ? terminalEnvelope.exitCode
+      : null;
+    const hasTerminalEnvelope = terminalEnvelope.version === 1 &&
+      terminalEnvelopeRunId === run.id &&
+      Boolean(terminalEnvelopeCompletedAt) &&
+      (terminalEnvelopeExitCode !== null || terminalEnvelopeSignal !== null || terminalEnvelopeError !== null);
+
     const [issue, completionComment] = await Promise.all([
       db
         .select({ status: issues.status, executionRunId: issues.executionRunId })
@@ -13586,7 +13607,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? readNonEmptyString(existingEnvelope.observedAt)
       : null;
     const observedAt = existingObservedAt ?? now.toISOString();
-    const hasCompleteTerminalEvidence = Boolean(issueStatus && commentId && commentBody);
+    const hasCompleteIssueEvidence = Boolean(issueStatus && commentId && commentBody);
+    const hasCompleteTerminalEvidence = hasTerminalEnvelope || hasCompleteIssueEvidence;
     const envelope = {
       version: 1,
       state: hasCompleteTerminalEvidence && !options.processAlive
@@ -13601,8 +13623,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       commentId,
       commentBody,
       commentCreatedAt,
+      childCompletion: hasTerminalEnvelope ? {
+        completedAt: terminalEnvelopeCompletedAt,
+        exitCode: terminalEnvelopeExitCode,
+        signal: terminalEnvelopeSignal,
+        errorMessage: terminalEnvelopeError,
+      } : null,
       evidence: hasCompleteTerminalEvidence
-        ? "run_attributed_terminal_issue_disposition"
+        ? hasTerminalEnvelope
+          ? "run_attributed_child_completion_envelope"
+          : "run_attributed_terminal_issue_disposition"
         : "partial_run_attributed_terminal_issue_evidence",
     };
     const envelopeResultJson = {
@@ -13628,26 +13658,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    const status = issueStatus === "done" ? "succeeded" : "cancelled";
+    const status = issueStatus === "cancelled" || terminalEnvelopeSignal === "SIGTERM" || terminalEnvelopeSignal === "SIGINT"
+      ? "cancelled"
+      : terminalEnvelopeExitCode === 0 || issueStatus === "done"
+        ? "succeeded"
+        : "failed";
+    const summary = commentBody ?? (
+      status === "succeeded"
+        ? "Adopted local child completed successfully."
+        : status === "cancelled"
+          ? `Adopted local child was cancelled${terminalEnvelopeSignal ? ` by ${terminalEnvelopeSignal}` : ""}.`
+          : terminalEnvelopeError ?? `Adopted local child exited with code ${terminalEnvelopeExitCode ?? "unknown"}.`
+    );
     const resultJson = mergeRunStopMetadataForAgent(agent, status, {
       resultJson: {
         ...envelopeResultJson,
-        summary: commentBody,
+        summary,
       },
     });
     const finalized = await setRunStatusIfRunning(run.id, status, {
       finishedAt: now,
-      error: null,
-      errorCode: null,
+      error: status === "failed" ? summary : null,
+      errorCode: status === "failed" ? "adapter_failed" : null,
+      exitCode: terminalEnvelopeExitCode,
+      signal: terminalEnvelopeSignal,
       resultJson,
     });
     if (!finalized.updated || !finalized.run) return null;
 
     let finalizedRun = finalized.run;
-    await setWakeupStatus(run.wakeupRequestId, status === "succeeded" ? "completed" : "cancelled", {
+    await setWakeupStatus(
+      run.wakeupRequestId,
+      status === "succeeded" ? "completed" : status,
+      {
       finishedAt: now,
-      error: null,
-    });
+      error: status === "failed" ? summary : null,
+      },
+    );
     finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, resultJson) ?? finalizedRun;
     await releaseEnvironmentLeasesForRun({
       runId: finalizedRun.id,
@@ -13661,14 +13708,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       eventType: "lifecycle",
       stream: "system",
       level: "info",
-      message: "Finalized adopted child from durable run-attributed issue completion",
+      message: "Finalized adopted child from durable run-attributed terminal evidence",
       payload: {
         issueId,
         issueStatus,
         commentId,
+        evidence: envelope.evidence,
       },
     });
-    await finalizeAgentStatus(run.agentId, status, null, {
+    await finalizeAgentStatus(run.agentId, status, status === "failed" ? summary : null, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
     return { state: "finalized" as const, run: finalizedRun, retryEligible: false };

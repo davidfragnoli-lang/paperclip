@@ -120,6 +120,7 @@ import {
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
 } from "../services/recovery/index.ts";
 import {
+  LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -2479,7 +2480,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("preserves an adopted completion envelope when its run-attributed comment precedes terminal issue disposition", async () => {
     const adoptedAt = new Date("2026-03-19T00:07:00.000Z");
     const exitedAt = new Date("2026-03-19T00:07:01.000Z");
-    const completedAt = new Date("2026-03-19T00:07:02.000Z");
+    const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-adopted-completion-"));
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "running",
       processPid: 999_999_999,
@@ -2488,6 +2489,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: {
         executionEngine: "cli",
         processTopology: "detached",
+        paperclipScratch: { type: "heartbeat_run", dir: scratchDir },
       },
     });
     await db.update(heartbeatRuns).set({
@@ -2512,35 +2514,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       createdAt: exitedAt,
       updatedAt: exitedAt,
     }).returning().then((rows) => rows[0]!);
+    await fs.writeFile(
+      path.join(scratchDir, LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME),
+      `${JSON.stringify({
+        version: 1,
+        runId,
+        exitCode: 0,
+        signal: null,
+        completedAt: exitedAt.toISOString(),
+        errorMessage: null,
+      })}\n`,
+    );
 
     const heartbeat = heartbeatService(db);
     expect(await heartbeat.reapOrphanedRuns({ now: exitedAt })).toEqual({ reaped: 0, runIds: [] });
-    const pending = await db.select().from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
-    expect(pending).toMatchObject({
-      status: "running",
-      processLossRetryCount: 0,
-      resultJson: {
-        hotRestartCompletion: {
-          version: 1,
-          state: "awaiting_terminal_evidence",
-          processExitedAt: exitedAt.toISOString(),
-          issueId,
-          issueStatus: null,
-          commentId: comment.id,
-        },
-      },
-    });
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
-
-    await db.update(issues).set({
-      status: "done",
-      checkoutRunId: null,
-      executionRunId: null,
-      completedAt,
-      updatedAt: completedAt,
-    }).where(eq(issues.id, issueId));
-    expect(await heartbeat.reapOrphanedRuns({ now: completedAt })).toEqual({ reaped: 0, runIds: [] });
     const finalized = await db.select().from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
     expect(finalized).toMatchObject({
@@ -2551,18 +2538,23 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         hotRestartCompletion: {
           version: 1,
           state: "completed",
-          issueStatus: "done",
+          processExitedAt: exitedAt.toISOString(),
+          issueId,
+          issueStatus: null,
           commentId: comment.id,
+          evidence: "run_attributed_child_completion_envelope",
         },
       },
     });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+    await fs.rm(scratchDir, { recursive: true, force: true });
   });
 
   it("preserves an adopted completion envelope when terminal issue disposition precedes its run-attributed comment", async () => {
     const adoptedAt = new Date("2026-03-19T00:07:00.000Z");
     const exitedAt = new Date("2026-03-19T00:07:01.000Z");
     const commentedAt = new Date("2026-03-19T00:07:02.000Z");
+    const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-adopted-completion-"));
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "running",
       processPid: 999_999_999,
@@ -2571,6 +2563,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: {
         executionEngine: "cli",
         processTopology: "detached",
+        paperclipScratch: { type: "heartbeat_run", dir: scratchDir },
       },
     });
     await db.update(heartbeatRuns).set({
@@ -2613,6 +2606,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
 
+    await fs.writeFile(
+      path.join(scratchDir, LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME),
+      `${JSON.stringify({
+        version: 1,
+        runId,
+        exitCode: 0,
+        signal: null,
+        completedAt: commentedAt.toISOString(),
+        errorMessage: null,
+      })}\n`,
+    );
+
     const comment = await db.insert(issueComments).values({
       companyId,
       issueId,
@@ -2636,10 +2641,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           state: "completed",
           issueStatus: "cancelled",
           commentId: comment.id,
+          evidence: "run_attributed_child_completion_envelope",
         },
       },
     });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+    await fs.rm(scratchDir, { recursive: true, force: true });
   });
 
   it.skipIf(process.platform === "win32")("keeps process-group-only hot-restart adoptions out of process_lost reaping", async () => {
