@@ -347,6 +347,7 @@ const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const ORPHANED_RUN_SILENCE_SWEEP_THRESHOLD_MS = 15 * 60 * 1000;
+const HOT_RESTART_COMPLETION_EVIDENCE_GRACE_MS = 60 * 1000;
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -13527,6 +13528,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
     now: Date,
+    options: { processAlive: boolean },
   ) {
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
@@ -13552,29 +13554,85 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .then((rows) => rows[0] ?? null),
     ]);
 
-    if (
-      !issue ||
-      (issue.executionRunId !== null && issue.executionRunId !== run.id) ||
-      !completionComment ||
-      (issue.status !== "done" && issue.status !== "cancelled")
-    ) {
-      return null;
+    const existingResultJson = parseObject(run.resultJson);
+    const existingEnvelope = parseObject(existingResultJson.hotRestartCompletion);
+    const existingEnvelopeIssueId = readNonEmptyString(existingEnvelope.issueId);
+    const existingIssueStatus = existingEnvelopeIssueId === issueId &&
+      (existingEnvelope.issueStatus === "done" || existingEnvelope.issueStatus === "cancelled")
+      ? existingEnvelope.issueStatus
+      : null;
+    const issueStatus = issue &&
+      (issue.executionRunId === null || issue.executionRunId === run.id) &&
+      (issue.status === "done" || issue.status === "cancelled")
+      ? issue.status
+      : existingIssueStatus;
+    const existingCommentId = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.commentId)
+      : null;
+    const existingCommentBody = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.commentBody)
+      : null;
+    const existingCommentCreatedAt = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.commentCreatedAt)
+      : null;
+    const commentId = completionComment?.id ?? existingCommentId;
+    const commentBody = completionComment?.body ?? existingCommentBody;
+    const commentCreatedAt = completionComment?.createdAt.toISOString() ?? existingCommentCreatedAt;
+    const existingProcessExitedAt = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.processExitedAt)
+      : null;
+    const processExitedAt = options.processAlive ? existingProcessExitedAt : (existingProcessExitedAt ?? now.toISOString());
+    const existingObservedAt = existingEnvelopeIssueId === issueId
+      ? readNonEmptyString(existingEnvelope.observedAt)
+      : null;
+    const observedAt = existingObservedAt ?? now.toISOString();
+    const hasCompleteTerminalEvidence = Boolean(issueStatus && commentId && commentBody);
+    const envelope = {
+      version: 1,
+      state: hasCompleteTerminalEvidence && !options.processAlive
+        ? "completed"
+        : "awaiting_terminal_evidence",
+      observed: hasCompleteTerminalEvidence && !options.processAlive,
+      observedAt,
+      updatedAt: now.toISOString(),
+      processExitedAt,
+      issueId,
+      issueStatus,
+      commentId,
+      commentBody,
+      commentCreatedAt,
+      evidence: hasCompleteTerminalEvidence
+        ? "run_attributed_terminal_issue_disposition"
+        : "partial_run_attributed_terminal_issue_evidence",
+    };
+    const envelopeResultJson = {
+      ...existingResultJson,
+      hotRestartCompletion: envelope,
+    };
+    const persistedEnvelope = await db
+      .update(heartbeatRuns)
+      .set({ resultJson: envelopeResultJson, updatedAt: now })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!persistedEnvelope) return null;
+
+    if (!hasCompleteTerminalEvidence || options.processAlive) {
+      const exitObservedAtMs = processExitedAt ? new Date(processExitedAt).getTime() : Number.NaN;
+      const retryEligible = Number.isFinite(exitObservedAtMs) &&
+        now.getTime() - exitObservedAtMs >= HOT_RESTART_COMPLETION_EVIDENCE_GRACE_MS;
+      return {
+        state: "pending" as const,
+        run: persistedEnvelope,
+        retryEligible,
+      };
     }
 
-    const status = issue.status === "done" ? "succeeded" : "cancelled";
+    const status = issueStatus === "done" ? "succeeded" : "cancelled";
     const resultJson = mergeRunStopMetadataForAgent(agent, status, {
       resultJson: {
-        ...parseObject(run.resultJson),
-        summary: completionComment.body,
-        hotRestartCompletion: {
-          observed: true,
-          observedAt: now.toISOString(),
-          issueId,
-          issueStatus: issue.status,
-          commentId: completionComment.id,
-          commentCreatedAt: completionComment.createdAt.toISOString(),
-          evidence: "run_attributed_terminal_issue_disposition",
-        },
+        ...envelopeResultJson,
+        summary: commentBody,
       },
     });
     const finalized = await setRunStatusIfRunning(run.id, status, {
@@ -13606,14 +13664,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message: "Finalized adopted child from durable run-attributed issue completion",
       payload: {
         issueId,
-        issueStatus: issue.status,
-        commentId: completionComment.id,
+        issueStatus,
+        commentId,
       },
     });
     await finalizeAgentStatus(run.agentId, status, null, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
-    return finalizedRun;
+    return { state: "finalized" as const, run: finalizedRun, retryEligible: false };
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; now?: Date }) {
@@ -13742,25 +13800,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const processGroupAlive = Boolean(
         tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId),
       );
-      if (
-        (processPidAlive || processGroupAlive) &&
-        hotRestartAdoption
-      ) {
-        continue;
-      }
       if (hotRestartAdoption) {
-        const completion = await observeAdoptedRunCompletion(run, { adapterType, adapterConfig }, now);
-        if (completion) {
+        const completion = await observeAdoptedRunCompletion(
+          run,
+          { adapterType, adapterConfig },
+          now,
+          { processAlive: processPidAlive || processGroupAlive },
+        );
+        if (completion?.state === "finalized") {
           logger.info(
             {
               runId: run.id,
-              status: completion.status,
+              status: completion.run.status,
               adoptedAt: hotRestartAdoption.adoptedAt,
             },
             "hot-restart adopted child completion observed under original run identity",
           );
           continue;
         }
+        if (completion && !completion.retryEligible) continue;
         const recovery = await drainRunningRunsForShutdown("SIGTERM", now, [run.id]);
         if (recovery.interruptedRunIds.includes(run.id)) {
           logger.warn(

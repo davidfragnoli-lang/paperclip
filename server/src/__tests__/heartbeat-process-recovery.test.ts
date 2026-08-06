@@ -2339,7 +2339,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("interrupts and retries an adopted run when its detached child exits after hot restart", async () => {
     const adoptedAt = new Date("2026-03-19T00:07:00.000Z");
-    const reapedAt = new Date("2026-03-19T00:07:01.000Z");
+    const exitedAt = new Date("2026-03-19T00:07:01.000Z");
+    const reapedAt = new Date("2026-03-19T00:08:01.000Z");
     const { agentId, runId } = await seedRunFixture({
       agentStatus: "running",
       processPid: 999_999_999,
@@ -2369,6 +2370,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(heartbeatRuns.id, runId));
 
     const heartbeat = heartbeatService(db);
+    expect(await heartbeat.reapOrphanedRuns({
+      staleThresholdMs: 5 * 60 * 1000,
+      now: exitedAt,
+    })).toEqual({ reaped: 0, runIds: [] });
     const result = await heartbeat.reapOrphanedRuns({
       staleThresholdMs: 5 * 60 * 1000,
       now: reapedAt,
@@ -2469,6 +2474,172 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("completed");
+  });
+
+  it("preserves an adopted completion envelope when its run-attributed comment precedes terminal issue disposition", async () => {
+    const adoptedAt = new Date("2026-03-19T00:07:00.000Z");
+    const exitedAt = new Date("2026-03-19T00:07:01.000Z");
+    const completedAt = new Date("2026-03-19T00:07:02.000Z");
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: 999_999_999,
+      now: adoptedAt,
+      updatedAt: adoptedAt,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+    await db.update(heartbeatRuns).set({
+      resultJson: {
+        hotRestart: {
+          adopted: true,
+          adoptedAt: adoptedAt.toISOString(),
+          previousServerPid: 101,
+          newServerPid: 202,
+          processPid: 999_999_999,
+          processGroupId: null,
+        },
+      },
+    }).where(eq(heartbeatRuns.id, runId));
+    const comment = await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      createdByRunId: runId,
+      body: "Completion comment persisted before the issue disposition.",
+      createdAt: exitedAt,
+      updatedAt: exitedAt,
+    }).returning().then((rows) => rows[0]!);
+
+    const heartbeat = heartbeatService(db);
+    expect(await heartbeat.reapOrphanedRuns({ now: exitedAt })).toEqual({ reaped: 0, runIds: [] });
+    const pending = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    expect(pending).toMatchObject({
+      status: "running",
+      processLossRetryCount: 0,
+      resultJson: {
+        hotRestartCompletion: {
+          version: 1,
+          state: "awaiting_terminal_evidence",
+          processExitedAt: exitedAt.toISOString(),
+          issueId,
+          issueStatus: null,
+          commentId: comment.id,
+        },
+      },
+    });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+
+    await db.update(issues).set({
+      status: "done",
+      checkoutRunId: null,
+      executionRunId: null,
+      completedAt,
+      updatedAt: completedAt,
+    }).where(eq(issues.id, issueId));
+    expect(await heartbeat.reapOrphanedRuns({ now: completedAt })).toEqual({ reaped: 0, runIds: [] });
+    const finalized = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    expect(finalized).toMatchObject({
+      status: "succeeded",
+      processLossRetryCount: 0,
+      resultJson: {
+        summary: "Completion comment persisted before the issue disposition.",
+        hotRestartCompletion: {
+          version: 1,
+          state: "completed",
+          issueStatus: "done",
+          commentId: comment.id,
+        },
+      },
+    });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+  });
+
+  it("preserves an adopted completion envelope when terminal issue disposition precedes its run-attributed comment", async () => {
+    const adoptedAt = new Date("2026-03-19T00:07:00.000Z");
+    const exitedAt = new Date("2026-03-19T00:07:01.000Z");
+    const commentedAt = new Date("2026-03-19T00:07:02.000Z");
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: 999_999_999,
+      now: adoptedAt,
+      updatedAt: adoptedAt,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+    await db.update(heartbeatRuns).set({
+      resultJson: {
+        hotRestart: {
+          adopted: true,
+          adoptedAt: adoptedAt.toISOString(),
+          previousServerPid: 101,
+          newServerPid: 202,
+          processPid: 999_999_999,
+          processGroupId: null,
+        },
+      },
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({
+      status: "cancelled",
+      checkoutRunId: null,
+      executionRunId: null,
+      cancelledAt: exitedAt,
+      updatedAt: exitedAt,
+    }).where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    expect(await heartbeat.reapOrphanedRuns({ now: exitedAt })).toEqual({ reaped: 0, runIds: [] });
+    const pending = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    expect(pending).toMatchObject({
+      status: "running",
+      processLossRetryCount: 0,
+      resultJson: {
+        hotRestartCompletion: {
+          version: 1,
+          state: "awaiting_terminal_evidence",
+          processExitedAt: exitedAt.toISOString(),
+          issueId,
+          issueStatus: "cancelled",
+          commentId: null,
+        },
+      },
+    });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+
+    const comment = await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      createdByRunId: runId,
+      body: "Cancellation comment persisted after the issue disposition.",
+      createdAt: commentedAt,
+      updatedAt: commentedAt,
+    }).returning().then((rows) => rows[0]!);
+    expect(await heartbeat.reapOrphanedRuns({ now: commentedAt })).toEqual({ reaped: 0, runIds: [] });
+    const finalized = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    expect(finalized).toMatchObject({
+      status: "cancelled",
+      processLossRetryCount: 0,
+      resultJson: {
+        summary: "Cancellation comment persisted after the issue disposition.",
+        hotRestartCompletion: {
+          version: 1,
+          state: "completed",
+          issueStatus: "cancelled",
+          commentId: comment.id,
+        },
+      },
+    });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
   });
 
   it.skipIf(process.platform === "win32")("keeps process-group-only hot-restart adoptions out of process_lost reaping", async () => {
