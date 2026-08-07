@@ -86,7 +86,15 @@ afterEach(async () => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  await Promise.all(tempRoots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+  // Remote ACP runs use a detached process-session event writer. Under suite
+  // load its final event can land between rm's directory scan and rmdir,
+  // producing ENOTEMPTY after the assertions have already passed. Retry that
+  // bounded teardown window instead of turning a successful test into a flake.
+  await Promise.all(
+    tempRoots.splice(0).map((root) =>
+      fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }),
+    ),
+  );
 });
 
 class FakeRuntime {
