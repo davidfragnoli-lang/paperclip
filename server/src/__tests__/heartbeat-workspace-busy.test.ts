@@ -764,6 +764,40 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     expect(executedRunIds).toContain(run!.id);
   });
 
+  it("keeps a severed-capture adopted run as the workspace holder until its deadline reaper finalizes it", async () => {
+    const adoptedAt = new Date();
+    const fixture = await seedWorkspaceFixture({
+      holderActivityAt: new Date(adoptedAt.getTime() - WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS - 60_000),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          hotRestart: {
+            adopted: true,
+            adoptedAt: adoptedAt.toISOString(),
+            outputCaptureState: "severed",
+            outputCaptureSeveredAt: adoptedAt.toISOString(),
+            adoptedRunDeadlineAt: new Date(adoptedAt.getTime() + 30 * 60 * 1000).toISOString(),
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, fixture.holderRunId));
+
+    const run = await heartbeat.invoke(
+      fixture.agentId,
+      "assignment",
+      { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+      "system",
+    );
+    expect(run).not.toBeNull();
+
+    const finishedRun = await waitForRunToLeaveActiveStates(run!.id);
+    expect(finishedRun?.status).toBe("cancelled");
+    expect(finishedRun?.errorCode).toBe(WORKSPACE_BUSY_ERROR_CODE);
+    expect(executedRunIds).not.toContain(run!.id);
+  });
+
   it("keeps deferring past earlier attempts while the holder is still live", async () => {
     const fixture = await seedWorkspaceFixture();
 
