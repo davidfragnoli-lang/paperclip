@@ -32,6 +32,7 @@ const {
   issueThreadInteractionServiceFactoryMock,
   issueThreadInteractionServiceMock,
   loadConfigMock,
+  loggerWarnMock,
   isIsolatedWorktreeRuntimeConfiguredMock,
   maybePersistWorktreeRuntimePortsMock,
   reconcilePersistedRuntimeServicesOnStartupMock,
@@ -63,6 +64,7 @@ const {
       dispatchRequeued: 0,
       continuationRequeued: 0,
       successfulRunHandoffEscalated: 0,
+      reviewParticipantTypedPendingSkipped: 0,
       escalated: 0,
       skipped: 0,
       issueIds: [],
@@ -129,6 +131,7 @@ const {
     close: vi.fn(),
   };
   const loadConfigMock = vi.fn();
+  const loggerWarnMock = vi.fn();
   const isIsolatedWorktreeRuntimeConfiguredMock = vi.fn(() => false);
   const maybePersistWorktreeRuntimePortsMock = vi.fn();
   const reconcilePersistedRuntimeServicesOnStartupMock = vi.fn(async () => ({ reconciled: 0 }));
@@ -154,6 +157,7 @@ const {
     issueThreadInteractionServiceFactoryMock,
     issueThreadInteractionServiceMock,
     loadConfigMock,
+    loggerWarnMock,
     isIsolatedWorktreeRuntimeConfiguredMock,
     maybePersistWorktreeRuntimePortsMock,
     reconcilePersistedRuntimeServicesOnStartupMock,
@@ -288,7 +292,7 @@ vi.mock("../middleware/logger.js", () => ({
       return this;
     }),
     info: vi.fn(),
-    warn: vi.fn(),
+    warn: loggerWarnMock,
     error: vi.fn(),
   },
 }));
@@ -640,6 +644,30 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledWith({
       staleThresholdMs: 5 * 60 * 1000,
     });
+  });
+
+  it("warns when typed review suppression is the only startup reconciliation change", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.reconcileStrandedAssignedIssues.mockResolvedValueOnce({
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      reviewParticipantTypedPendingSkipped: 1,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    });
+
+    await startServer();
+
+    expect(loggerWarnMock).toHaveBeenCalledWith(
+      expect.objectContaining({ reviewParticipantTypedPendingSkipped: 1 }),
+      "startup heartbeat recovery changed assigned issue state",
+    );
   });
 
   it("preserves the startup orphan-reap guard across retries", async () => {
