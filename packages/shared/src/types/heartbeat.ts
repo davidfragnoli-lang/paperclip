@@ -160,6 +160,9 @@ export interface HeartbeatRunOutputSilence {
   evaluationIssueId: string | null;
   evaluationIssueIdentifier: string | null;
   evaluationIssueAssigneeAgentId: string | null;
+  outputCaptureState?: "attached" | "severed";
+  outputCaptureSeveredAt?: Date | string | null;
+  adoptedRunDeadlineAt?: Date | string | null;
 }
 
 export interface AgentWakeupSkipped {

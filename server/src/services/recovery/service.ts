@@ -317,6 +317,9 @@ export type RunOutputSilenceSummary = {
   evaluationIssueId: string | null;
   evaluationIssueIdentifier: string | null;
   evaluationIssueAssigneeAgentId: string | null;
+  outputCaptureState: "attached" | "severed";
+  outputCaptureSeveredAt: Date | null;
+  adoptedRunDeadlineAt: Date | null;
 };
 
 function readNonEmptyString(value: unknown): string | null {
@@ -1711,6 +1714,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return startedAt ? Math.max(0, now.getTime() - startedAt.getTime()) : null;
   }
 
+  function hotRestartOutputCaptureMetadata(resultJson: unknown) {
+    const hotRestart = parseObject(parseObject(resultJson).hotRestart);
+    if (
+      hotRestart.outputCaptureState !== "severed" ||
+      typeof hotRestart.outputCaptureSeveredAt !== "string"
+    ) {
+      return null;
+    }
+    const severedAt = new Date(hotRestart.outputCaptureSeveredAt);
+    if (Number.isNaN(severedAt.getTime())) return null;
+    const deadlineAt = typeof hotRestart.adoptedRunDeadlineAt === "string"
+      ? new Date(hotRestart.adoptedRunDeadlineAt)
+      : null;
+    return {
+      severedAt,
+      deadlineAt: deadlineAt && !Number.isNaN(deadlineAt.getTime()) ? deadlineAt : null,
+    };
+  }
+
   async function latestActiveOutputQuietUntilDecision(companyId: string, runId: string, now = new Date()) {
     const [row] = await db
       .select()
@@ -1801,16 +1823,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
       "id" | "companyId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt"
-    >,
+    > & { resultJson?: unknown },
     now = new Date(),
   ): Promise<RunOutputSilenceSummary> {
     const [quietUntilDecision, evaluation] = await Promise.all([
       latestActiveOutputQuietUntilDecision(run.companyId, run.id, now),
       findOpenStaleRunEvaluation(run.companyId, run.id),
     ]);
-    const silenceStartedAt = silenceStartedAtForRun(run);
-    const silenceAgeMs = run.status === "running" ? silenceAgeMsForRun(run, now) : null;
-    const level = run.status !== "running"
+    const capture = hotRestartOutputCaptureMetadata(run.resultJson);
+    const silenceStartedAt = capture ? null : silenceStartedAtForRun(run);
+    const silenceAgeMs = run.status === "running" && !capture ? silenceAgeMsForRun(run, now) : null;
+    const level = run.status !== "running" || capture
       ? "not_applicable"
       : quietUntilDecision
         ? "snoozed"
@@ -1834,6 +1857,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       evaluationIssueId: evaluation?.id ?? null,
       evaluationIssueIdentifier: evaluation?.identifier ?? null,
       evaluationIssueAssigneeAgentId: evaluation?.assigneeAgentId ?? null,
+      outputCaptureState: capture ? "severed" : "attached",
+      outputCaptureSeveredAt: capture?.severedAt ?? null,
+      adoptedRunDeadlineAt: capture?.deadlineAt ?? null,
     };
   }
 
@@ -2419,6 +2445,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     run: typeof heartbeatRuns.$inferSelect;
     now: Date;
   }) {
+    if (hotRestartOutputCaptureMetadata(input.run.resultJson)) return { kind: "skipped" as const };
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
     const sourceIssue = await resolveStaleRunSourceIssue(input.run);
@@ -2654,6 +2681,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
           eq(heartbeatRuns.status, "running"),
+          sql`${heartbeatRuns.resultJson} -> 'hotRestart' ->> 'outputCaptureState' is distinct from 'severed'`,
           sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${suspicionBefore.toISOString()}::timestamptz`,
         ),
       )
