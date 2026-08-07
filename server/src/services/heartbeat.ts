@@ -360,6 +360,8 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const ORPHANED_RUN_SILENCE_SWEEP_THRESHOLD_MS = 15 * 60 * 1000;
 const HOT_RESTART_COMPLETION_EVIDENCE_GRACE_MS = 60 * 1000;
+export const HOT_RESTART_ADOPTED_RUN_DEADLINE_MS = 30 * 60 * 1000;
+const HOT_RESTART_ADOPTED_RUN_DEADLINE_ERROR_CODE = "hot_restart_adopted_run_deadline";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -6338,6 +6340,12 @@ function readHotRestartAdoptionMetadata(resultJson: Record<string, unknown> | nu
   return hotRestart;
 }
 
+function readHotRestartAdoptedRunDeadline(hotRestart: Record<string, unknown>) {
+  if (typeof hotRestart.adoptedRunDeadlineAt !== "string") return null;
+  const deadline = new Date(hotRestart.adoptedRunDeadlineAt);
+  return Number.isNaN(deadline.getTime()) ? null : deadline;
+}
+
 function mergeHotRestartAdoptionResultJson(
   resultJson: Record<string, unknown> | null | undefined,
   input: {
@@ -6352,12 +6360,25 @@ function mergeHotRestartAdoptionResultJson(
 ) {
   const result = parseObject(resultJson);
   const existing = parseObject(result.hotRestart);
+  const existingCaptureSeveredAt = typeof existing.outputCaptureSeveredAt === "string"
+    ? new Date(existing.outputCaptureSeveredAt)
+    : null;
+  const outputCaptureSeveredAt = existingCaptureSeveredAt && !Number.isNaN(existingCaptureSeveredAt.getTime())
+    ? existingCaptureSeveredAt
+    : input.adoptedAt;
+  const existingDeadlineAt = readHotRestartAdoptedRunDeadline(existing);
+  const adoptedRunDeadlineAt = existingDeadlineAt ?? new Date(
+    outputCaptureSeveredAt.getTime() + HOT_RESTART_ADOPTED_RUN_DEADLINE_MS,
+  );
   return {
     ...result,
     hotRestart: {
       ...existing,
       adopted: true,
       adoptedAt: input.adoptedAt.toISOString(),
+      outputCaptureState: "severed",
+      outputCaptureSeveredAt: outputCaptureSeveredAt.toISOString(),
+      adoptedRunDeadlineAt: adoptedRunDeadlineAt.toISOString(),
       previousServerPid: input.previousServerPid,
       newServerPid: input.newServerPid,
       previousServerVersion: input.previousServerVersion,
@@ -11195,6 +11216,71 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  async function expireHotRestartAdoptedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now: Date,
+    deadlineAt: Date,
+  ) {
+    try {
+      await terminateHeartbeatRunProcess({
+        pid: run.processPid,
+        processGroupId: run.processGroupId,
+      });
+    } finally {
+      runningProcesses.delete(run.id);
+    }
+
+    const message = `Hot-restart adopted run exceeded its absolute post-adoption deadline at ${deadlineAt.toISOString()}`;
+    const timedOutStatus = await setRunStatusIfRunning(run.id, "timed_out", {
+      finishedAt: now,
+      error: message,
+      errorCode: HOT_RESTART_ADOPTED_RUN_DEADLINE_ERROR_CODE,
+      signal: "SIGTERM",
+      resultJson: mergeRunStopMetadataForAgent(agent, "timed_out", {
+        resultJson: parseObject(run.resultJson),
+        errorCode: HOT_RESTART_ADOPTED_RUN_DEADLINE_ERROR_CODE,
+        errorMessage: message,
+      }),
+    });
+    if (!timedOutStatus.updated || !timedOutStatus.run) return null;
+
+    let timedOut = timedOutStatus.run;
+    await setWakeupStatus(run.wakeupRequestId, "failed", {
+      finishedAt: now,
+      error: message,
+    });
+    timedOut = await classifyAndPersistRunLiveness(timedOut, parseObject(timedOut.resultJson)) ?? timedOut;
+    await releaseEnvironmentLeasesForRun({
+      runId: timedOut.id,
+      companyId: timedOut.companyId,
+      agentId: timedOut.agentId,
+      status: timedOut.status,
+      failureReason: message,
+    });
+
+    const retry = await enqueueProcessLossRetry(timedOut, agent, now);
+    if (!retry) await releaseIssueExecutionAndPromote(timedOut);
+
+    await appendRunEvent(timedOut, await nextRunEventSeq(timedOut.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "error",
+      message,
+      payload: {
+        adoptedRunDeadlineAt: deadlineAt.toISOString(),
+        outputCaptureState: "severed",
+        ...(run.processPid ? { processPid: run.processPid } : {}),
+        ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+        ...(retry ? { retryRunId: retry.id } : {}),
+      },
+    });
+    await finalizeAgentStatus(run.agentId, "timed_out", message, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
+    return { run: timedOut, retry };
+  }
+
   type ScheduledRetryGate =
     | { allowed: true }
     | {
@@ -12279,7 +12365,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ne(heartbeatRuns.id, input.excludeRunId),
           // Last observed activity: output beats start beats creation. A run
           // that started recently but has not written output yet is live.
-          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${staleCutoff.toISOString()}::timestamptz`,
+          or(
+            sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${staleCutoff.toISOString()}::timestamptz`,
+            sql`${heartbeatRuns.resultJson} -> 'hotRestart' ->> 'outputCaptureState' = 'severed'`,
+          ),
           eq(issues.projectWorkspaceId, input.projectWorkspaceId),
           ne(sql`${issues.id}::text`, input.excludeIssueId),
           ...(input.honorIsolatedWorkspaceModes
@@ -14092,9 +14181,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const activeRuns = await db
       .select({
         run: heartbeatRuns,
-        adapterType: agents.adapterType,
-        adapterConfig: agents.adapterConfig,
-        agentStatus: agents.status,
+        agent: agents,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -14138,10 +14225,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const reaped: string[] = [];
 
-    for (const { run, adapterType, adapterConfig, agentStatus } of activeRuns) {
+    for (const { run, agent } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       const hotRestartAdoption = readHotRestartAdoptionMetadata(parseObject(run.resultJson));
+      const adapterType = agent.adapterType;
+      const adapterConfig = agent.adapterConfig;
+      const agentStatus = agent.status;
 
       // Apply staleness threshold to avoid false positives
       // Hot-restart adoption cannot restore the previous server's in-memory
@@ -14208,6 +14298,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId),
       );
       if (hotRestartAdoption) {
+        const adoptedRunDeadline = readHotRestartAdoptedRunDeadline(hotRestartAdoption);
+        if (adoptedRunDeadline && now.getTime() >= adoptedRunDeadline.getTime()) {
+          const expired = await expireHotRestartAdoptedRun(run, agent, now, adoptedRunDeadline);
+          if (expired) {
+            reaped.push(run.id);
+            logger.warn(
+              {
+                runId: run.id,
+                adoptedAt: hotRestartAdoption.adoptedAt,
+                adoptedRunDeadlineAt: adoptedRunDeadline.toISOString(),
+                retryRunId: expired.retry?.id ?? null,
+              },
+              "terminated hot-restart adopted run at its absolute post-adoption deadline",
+            );
+          }
+          continue;
+        }
         const completion = await observeAdoptedRunCompletion(
           run,
           { adapterType, adapterConfig },

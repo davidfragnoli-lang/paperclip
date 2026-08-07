@@ -2402,7 +2402,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
       expect(typeof report.newServerVersion).toBe("string");
 
-      const reap = await heartbeat.reapOrphanedRuns();
+      const reap = await heartbeat.reapOrphanedRuns({
+        now: new Date("2026-03-19T00:08:00.000Z"),
+      });
       expect(reap).toEqual({ reaped: 0, runIds: [] });
       const adopted = await db
         .select()
@@ -2415,12 +2417,102 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         hotRestart: {
           adopted: true,
           adoptedAt: "2026-03-19T00:07:00.000Z",
+          outputCaptureState: "severed",
+          outputCaptureSeveredAt: "2026-03-19T00:07:00.000Z",
+          adoptedRunDeadlineAt: "2026-03-19T00:37:00.000Z",
           previousServerPid: process.pid,
           newServerPid: process.pid,
           previousServerVersion: "old-version",
           processPid: child.pid,
         },
       });
+
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "newer-version",
+        requestedAt: new Date("2026-03-19T00:09:00.000Z"),
+      });
+      await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:10:00.000Z"),
+      );
+      await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:11:00.000Z"),
+      );
+      const adoptedAgain = await db
+        .select({ resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(adoptedAgain?.resultJson).toMatchObject({
+        hotRestart: {
+          adoptedAt: "2026-03-19T00:11:00.000Z",
+          outputCaptureSeveredAt: "2026-03-19T00:07:00.000Z",
+          adoptedRunDeadlineAt: "2026-03-19T00:37:00.000Z",
+        },
+      });
+    });
+  });
+
+  it("terminates and retries an adopted run when its post-adoption deadline expires", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeGreaterThan(0);
+    const adoptedAt = new Date("2026-03-19T00:07:00.000Z");
+    const deadlineAt = new Date("2026-03-19T00:37:00.000Z");
+    const { agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      now: adoptedAt,
+      updatedAt: adoptedAt,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          hotRestart: {
+            adopted: true,
+            adoptedAt: adoptedAt.toISOString(),
+            outputCaptureState: "severed",
+            outputCaptureSeveredAt: adoptedAt.toISOString(),
+            adoptedRunDeadlineAt: deadlineAt.toISOString(),
+            previousServerPid: 101,
+            newServerPid: 202,
+            previousServerVersion: "old-version",
+            newServerVersion: "new-version",
+            processPid: child.pid,
+            processGroupId: null,
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const heartbeat = heartbeatService(db);
+    const beforeDeadline = await heartbeat.reapOrphanedRuns({
+      now: new Date(deadlineAt.getTime() - 1),
+    });
+    expect(beforeDeadline).toEqual({ reaped: 0, runIds: [] });
+    expect(await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))
+      .toEqual([{ status: "running" }]);
+
+    await heartbeat.reapOrphanedRuns({ now: deadlineAt });
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const expiredRun = runs.find((row) => row.id === runId);
+    const retryRun = runs.find((row) => row.retryOfRunId === runId);
+    expect(expiredRun).toMatchObject({
+      status: "timed_out",
+      errorCode: "hot_restart_adopted_run_deadline",
+      signal: "SIGTERM",
+    });
+    expect(retryRun).toMatchObject({
+      status: "queued",
+      retryOfRunId: runId,
+      processLossRetryCount: 1,
     });
   });
 
@@ -2772,7 +2864,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         skippedRunIds: [],
       });
 
-      const reap = await heartbeat.reapOrphanedRuns();
+      const reap = await heartbeat.reapOrphanedRuns({
+        now: new Date("2026-03-19T00:08:00.000Z"),
+      });
       expect(reap).toEqual({ reaped: 0, runIds: [] });
       expect(isPidAlive(orphan.descendantPid)).toBe(true);
       const adopted = await db
