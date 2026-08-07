@@ -670,6 +670,45 @@ describe("startServer feedback export wiring", () => {
     );
   });
 
+  it("warns when typed review suppression is the only periodic reconciliation change", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockResolvedValueOnce({
+        assignmentDispatched: 0,
+        dispatchRequeued: 0,
+        continuationRequeued: 0,
+        successfulRunHandoffEscalated: 0,
+        reviewParticipantTypedPendingSkipped: 1,
+        escalated: 0,
+        skipped: 0,
+        issueIds: [],
+      });
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await vi.waitFor(() => {
+        expect(loggerWarnMock).toHaveBeenCalledWith(
+          expect.objectContaining({ reviewParticipantTypedPendingSkipped: 1 }),
+          "periodic heartbeat recovery changed assigned issue state",
+        );
+      });
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("preserves the startup orphan-reap guard across retries", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
