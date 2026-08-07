@@ -112,6 +112,7 @@ import {
   resolveHotRestartReportPath,
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
+import { REVIEW_PARTICIPANT_PENDING_SUPPRESSION_MAX_AGE_MS } from "../services/recovery/service.ts";
 import { resolveLocalRunLogPath } from "../services/run-log-store.ts";
 import { environmentRuntimeService } from "../services/environment-runtime.ts";
 import { secretService } from "../services/secrets.ts";
@@ -5457,6 +5458,109 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
     }
+  });
+
+  it("suppresses typed-pending review recovery within the bound", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } = await seedInReviewParticipantRunFixture({
+      wakeReason: "manual",
+    });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    const freshPendingAt = new Date();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "completed",
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db
+      .update(issues)
+      .set({ executionLockedAt: freshPendingAt, updatedAt: freshPendingAt })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.reviewParticipantTypedPendingSkipped).toBe(1);
+    expect(result.reviewParticipantRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(recoveryActions).toHaveLength(0);
+  });
+
+  it("escalates typed-pending review recovery after the bound expires", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({ wakeReason: "manual" });
+    const staleAt = new Date(Date.now() - REVIEW_PARTICIPANT_PENDING_SUPPRESSION_MAX_AGE_MS - 5 * 60_000);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        startedAt: staleAt,
+        finishedAt: staleAt,
+        updatedAt: staleAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "completed",
+        finishedAt: staleAt,
+        updatedAt: staleAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db
+      .update(issues)
+      .set({ executionLockedAt: staleAt, updatedAt: staleAt })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.reviewParticipantTypedPendingSkipped).toBe(0);
+    expect(result.reviewParticipantRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const sourceIssue = await waitForValue(async () => {
+      const row = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      return row?.status === "blocked" ? row : null;
+    });
+    expect(sourceIssue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+
+    const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_review",
+      cause: "execution_review_participant_recovery",
+    });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(
+      comments.some(
+        (comment) =>
+          comment.body.includes("suppression is capped") &&
+          comment.body.includes(`Recovery action: \`${recoveryAction.id}\``),
+      ),
+    ).toBe(true);
   });
 
   it("re-enqueues an already stranded execution-review participant during reconciliation", async () => {
