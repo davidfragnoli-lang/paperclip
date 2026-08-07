@@ -715,10 +715,30 @@ type PaperclipWakeRecovery = {
   routingFallbackReason: string | null;
 };
 
+type PaperclipAssignmentWakeBatch = {
+  issueCount: number;
+  absorbedRunCount: number;
+  instruction: string | null;
+  issues: Array<{
+    issueId: string;
+    mutation: string | null;
+    wakeReason: string | null;
+    taskKey: string | null;
+    issue: {
+      id: string;
+      identifier: string | null;
+      title: string;
+      status: string;
+      priority: string;
+    } | null;
+  }>;
+};
+
 type PaperclipWakePayload = {
   reason: string | null;
   recovery: PaperclipWakeRecovery | null;
   issue: PaperclipWakeIssue | null;
+  assignmentWakeBatch: PaperclipAssignmentWakeBatch | null;
   checkedOutByHarness: boolean;
   // Experimental: write user-interaction content in ASD-STE100 Simplified
   // Technical English with brief decision context.
@@ -768,6 +788,41 @@ function normalizePaperclipWakeRecovery(value: unknown): PaperclipWakeRecovery |
     maxAttempts: typeof recovery.maxAttempts === "number" ? recovery.maxAttempts : null,
     nextAction: asString(recovery.nextAction, "").trim() || null,
     routingFallbackReason: asString(recovery.routingFallbackReason, "").trim() || null,
+  };
+}
+
+function normalizePaperclipAssignmentWakeBatch(value: unknown): PaperclipAssignmentWakeBatch | null {
+  const batch = parseObject(value);
+  const issues = Array.isArray(batch.issues)
+    ? batch.issues.flatMap((rawItem) => {
+        const item = parseObject(rawItem);
+        const issueId = asString(item.issueId, "").trim();
+        if (!issueId) return [];
+        const rawIssue = parseObject(item.issue);
+        const id = asString(rawIssue.id, "").trim();
+        return [{
+          issueId,
+          mutation: asString(item.mutation, "").trim() || null,
+          wakeReason: asString(item.wakeReason, "").trim() || null,
+          taskKey: asString(item.taskKey, "").trim() || null,
+          issue: id
+            ? {
+                id,
+                identifier: asString(rawIssue.identifier, "").trim() || null,
+                title: asString(rawIssue.title, "").trim(),
+                status: asString(rawIssue.status, "").trim(),
+                priority: asString(rawIssue.priority, "").trim(),
+              }
+            : null,
+        }];
+      })
+    : [];
+  if (issues.length === 0) return null;
+  return {
+    issueCount: Math.max(issues.length, Math.floor(asNumber(batch.issueCount, issues.length))),
+    absorbedRunCount: Math.max(0, Math.floor(asNumber(batch.absorbedRunCount, 0))),
+    instruction: asString(batch.instruction, "").trim() || null,
+    issues,
   };
 }
 
@@ -1345,6 +1400,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
   const livenessContinuation = normalizePaperclipWakeLivenessContinuation(payload.livenessContinuation);
   const taskWatchdog = normalizePaperclipWakeTaskWatchdog(payload.taskWatchdog);
   const recovery = normalizePaperclipWakeRecovery(payload.recovery);
+  const assignmentWakeBatch = normalizePaperclipAssignmentWakeBatch(payload.assignmentWakeBatch);
   const childIssueSummaries = Array.isArray(payload.childIssueSummaries)
     ? payload.childIssueSummaries
         .map((entry) => normalizePaperclipWakeChildIssueSummary(entry))
@@ -1365,7 +1421,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
   const checkboxSelection = normalizePaperclipWakeCheckboxSelection(payload.checkboxSelection);
   const executionWorkspace = normalizePaperclipWakeExecutionWorkspace(payload.executionWorkspace);
   const agentMessage = normalizePaperclipWakeAgentMessage(payload.agentMessage);
-  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !agentMessage && !recovery && !normalizePaperclipWakeIssue(payload.issue)) {
+  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !agentMessage && !recovery && !assignmentWakeBatch && !normalizePaperclipWakeIssue(payload.issue)) {
     return null;
   }
 
@@ -1373,6 +1429,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     reason: asString(payload.reason, "").trim() || null,
     recovery,
     issue: normalizePaperclipWakeIssue(payload.issue),
+    assignmentWakeBatch,
     checkedOutByHarness: asBoolean(payload.checkedOutByHarness, false),
     simplifiedEnglishInteractions: asBoolean(payload.simplifiedEnglishInteractions, false),
     dependencyBlockedInteraction: asBoolean(payload.dependencyBlockedInteraction, false),
@@ -1560,6 +1617,12 @@ export function renderPaperclipWakePrompt(
   const wakeSummaryLines = [
     `- reason: ${normalized.reason ?? "unknown"}`,
     `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
+    ...(normalized.assignmentWakeBatch
+      ? [
+          `- assignment mutation batch: ${normalized.assignmentWakeBatch.issueCount} issues (${normalized.assignmentWakeBatch.absorbedRunCount} queued runs absorbed)`,
+          `- batch instruction: ${normalized.assignmentWakeBatch.instruction ?? "Review all listed issue mutations in this session."}`,
+        ]
+      : []),
     ...(hasWakeCommentBatch
       ? [
           `- pending comments: ${normalized.includedCount}/${normalized.requestedCount}`,

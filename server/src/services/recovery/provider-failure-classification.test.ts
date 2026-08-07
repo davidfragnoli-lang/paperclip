@@ -60,6 +60,10 @@ const NON_ADAPTER_FAILURE_ERROR_CODE_EXCLUSIONS: ReadonlyMap<string, string> = n
   ["agent_not_found", "Heartbeat dispatch could not resolve an agent; this is not an adapter failure."],
   ["agent_not_invokable", "Agent lifecycle policy prevented invocation; retry requires lifecycle state to change."],
   ["agent_paused", "The agent was paused; board lifecycle owns the outcome."],
+  [
+    "assignment_wakeup_batched",
+    "The scheduler absorbed a redundant queued assignment wake; no adapter invocation failed.",
+  ],
   ["budget_blocked", "Budget policy prevented invocation; retry requires budget state to change."],
   ["cancelled", "The adapter run was deliberately cancelled; cancellation lifecycle owns the outcome."],
   ["issue_assignee_changed", "Issue ownership changed during execution; board lifecycle owns the outcome."],

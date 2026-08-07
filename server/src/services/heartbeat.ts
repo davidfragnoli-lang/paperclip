@@ -354,6 +354,7 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
+const ASSIGNMENT_WAKE_BATCH_KEY = "assignmentWakeBatch";
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
@@ -5509,11 +5510,49 @@ export async function buildPaperclipWakePayload(input: {
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
+  const rawAssignmentWakeBatch = Array.isArray(input.contextSnapshot[ASSIGNMENT_WAKE_BATCH_KEY])
+    ? input.contextSnapshot[ASSIGNMENT_WAKE_BATCH_KEY]
+    : [];
+  const assignmentWakeBatchItems = rawAssignmentWakeBatch
+    .map((value) => parseObject(value))
+    .map((value) => ({
+      issueId: readNonEmptyString(value.issueId),
+      mutation: readNonEmptyString(value.mutation),
+      wakeReason: readNonEmptyString(value.wakeReason),
+      taskKey: readNonEmptyString(value.taskKey),
+    }))
+    .filter((value): value is {
+      issueId: string;
+      mutation: string | null;
+      wakeReason: string | null;
+      taskKey: string | null;
+    } => Boolean(value.issueId));
+  const assignmentBatchIssueRows = assignmentWakeBatchItems.length > 0
+    ? await input.db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        priority: issues.priority,
+      })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, input.companyId),
+        inArray(issues.id, [...new Set(assignmentWakeBatchItems.map((item) => item.issueId))]),
+      ))
+    : [];
+  const assignmentBatchIssueById = new Map(assignmentBatchIssueRows.map((row) => [row.id, row]));
+  const assignmentWakeBatch = assignmentWakeBatchItems.map((item) => ({
+    ...item,
+    issue: assignmentBatchIssueById.get(item.issueId) ?? null,
+  }));
   if (
     commentIds.length === 0
     && Object.keys(executionStage).length === 0
     && !issueSummary
     && !agentMessageText
+    && assignmentWakeBatch.length === 0
   ) return null;
 
   const commentRows =
@@ -5728,6 +5767,18 @@ export async function buildPaperclipWakePayload(input: {
           status: issueSummary.status,
           priority: issueSummary.priority,
           workMode: issueSummary.workMode,
+        }
+      : null,
+    assignmentWakeBatch: assignmentWakeBatch.length > 0
+      ? {
+          issueCount: assignmentWakeBatch.length,
+          absorbedRunCount: Math.max(
+            0,
+            Math.floor(asNumber(input.contextSnapshot.assignmentWakeAbsorbedRunCount, 0)),
+          ),
+          issues: assignmentWakeBatch,
+          instruction:
+            "Review this mutation batch in one session. The primary issue remains the checked-out execution scope; fetch or checkout another issue only before mutating it.",
         }
       : null,
     agentMessage: agentMessageText
@@ -12925,18 +12976,186 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const claimResult = await db.transaction(async (tx) => {
+      let claimed = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          responsibleUserId,
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!claimed?.wakeupRequestId) return { claimed, absorbedRuns: [] };
+
+      const primaryWakeup = await tx
+        .select({
+          source: agentWakeupRequests.source,
+          triggerDetail: agentWakeupRequests.triggerDetail,
+          payload: agentWakeupRequests.payload,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, claimed.wakeupRequestId))
+        .then((rows) => rows[0] ?? null);
+      const primaryPayload = parseObject(primaryWakeup?.payload);
+      const primaryMutation = readNonEmptyString(primaryPayload.mutation);
+      if (
+        primaryWakeup?.source !== "assignment" ||
+        primaryWakeup.triggerDetail !== "system" ||
+        !primaryMutation
+      ) {
+        return { claimed, absorbedRuns: [] };
+      }
+
+      // System-generated issue mutation wakes are board-review signals, not
+      // independent user conversations. Once one such run claims the agent,
+      // atomically absorb every other queued mutation wake for that agent so a
+      // recovery storm costs one adapter session instead of one session per
+      // issue. Human comments, approvals, retries, and on-demand wakes retain
+      // their dedicated run semantics because they do not match this gate.
+      const queuedMutationWakes = await tx
+        .select({
+          run: heartbeatRuns,
+          wakeupId: agentWakeupRequests.id,
+          wakeupPayload: agentWakeupRequests.payload,
+        })
+        .from(heartbeatRuns)
+        .innerJoin(agentWakeupRequests, eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId))
+        .where(and(
+          eq(heartbeatRuns.companyId, claimed.companyId),
+          eq(heartbeatRuns.agentId, claimed.agentId),
+          eq(heartbeatRuns.status, "queued"),
+          eq(heartbeatRuns.invocationSource, "assignment"),
+          eq(heartbeatRuns.triggerDetail, "system"),
+          eq(agentWakeupRequests.status, "queued"),
+          eq(agentWakeupRequests.source, "assignment"),
+          eq(agentWakeupRequests.triggerDetail, "system"),
+          sql`${heartbeatRuns.id} <> ${claimed.id}`,
+        ))
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+
+      const batchableWakes = queuedMutationWakes.filter((candidate) =>
+        Boolean(readNonEmptyString(parseObject(candidate.wakeupPayload).mutation))
+      );
+      if (batchableWakes.length === 0) return { claimed, absorbedRuns: [] };
+
+      const candidateRunIds = batchableWakes.map((candidate) => candidate.run.id);
+      const absorbedRuns = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          finishedAt: claimedAt,
+          error: `Batched into assignment wake run ${claimed.id}`,
+          errorCode: "assignment_wakeup_batched",
+          updatedAt: claimedAt,
+        })
+        .where(and(
+          inArray(heartbeatRuns.id, candidateRunIds),
+          eq(heartbeatRuns.status, "queued"),
+        ))
+        .returning();
+      if (absorbedRuns.length === 0) return { claimed, absorbedRuns: [] };
+
+      const absorbedRunIds = new Set(absorbedRuns.map((absorbed) => absorbed.id));
+      const absorbedWakes = batchableWakes.filter((candidate) => absorbedRunIds.has(candidate.run.id));
+      const absorbedWakeupIds = absorbedWakes.map((candidate) => candidate.wakeupId);
+      await tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "coalesced",
+          runId: claimed.id,
+          claimedAt,
+          finishedAt: claimedAt,
+          coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+          updatedAt: claimedAt,
+        })
+        .where(inArray(agentWakeupRequests.id, absorbedWakeupIds));
+
+      const candidateIssueIds = [...new Set(absorbedWakes
+        .map((candidate) => readNonEmptyString(parseObject(candidate.wakeupPayload).issueId))
+        .filter((candidateIssueId): candidateIssueId is string => Boolean(candidateIssueId)))];
+      const currentIssues = candidateIssueIds.length > 0
+        ? await tx
+          .select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+          .from(issues)
+          .where(and(eq(issues.companyId, claimed.companyId), inArray(issues.id, candidateIssueIds)))
+        : [];
+      const currentIssueById = new Map(currentIssues.map((candidateIssue) => [candidateIssue.id, candidateIssue]));
+      const primaryContext = parseObject(claimed.contextSnapshot);
+      const primaryIssueId = readNonEmptyString(primaryContext.issueId) ?? readNonEmptyString(primaryPayload.issueId);
+      const batchItems: Array<Record<string, unknown>> = primaryIssueId
+        ? [{
+            issueId: primaryIssueId,
+            mutation: primaryMutation,
+            wakeReason: readNonEmptyString(primaryContext.wakeReason),
+            taskKey: readNonEmptyString(primaryPayload.taskKey) ?? readNonEmptyString(primaryContext.taskKey),
+          }]
+        : [];
+
+      for (const candidate of absorbedWakes) {
+        const candidatePayload = parseObject(candidate.wakeupPayload);
+        const candidateContext = parseObject(candidate.run.contextSnapshot);
+        const candidateIssueId =
+          readNonEmptyString(candidateContext.issueId) ?? readNonEmptyString(candidatePayload.issueId);
+        const currentIssue = candidateIssueId ? currentIssueById.get(candidateIssueId) : null;
+        if (
+          !candidateIssueId ||
+          !currentIssue ||
+          currentIssue.assigneeAgentId !== claimed.agentId ||
+          currentIssue.status === "done" ||
+          currentIssue.status === "cancelled" ||
+          currentIssue.status === "backlog"
+        ) {
+          continue;
+        }
+        batchItems.push({
+          issueId: candidateIssueId,
+          mutation: readNonEmptyString(candidatePayload.mutation),
+          wakeReason: readNonEmptyString(candidateContext.wakeReason),
+          taskKey: readNonEmptyString(candidatePayload.taskKey) ?? readNonEmptyString(candidateContext.taskKey),
+        });
+      }
+
+      claimed = await tx
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: {
+            ...primaryContext,
+            [ASSIGNMENT_WAKE_BATCH_KEY]: batchItems,
+            assignmentWakeBatchCount: batchItems.length,
+            assignmentWakeAbsorbedRunCount: absorbedRuns.length,
+          },
+          updatedAt: claimedAt,
+        })
+        .where(eq(heartbeatRuns.id, claimed.id))
+        .returning()
+        .then((rows) => rows[0] ?? claimed);
+
+      return { claimed, absorbedRuns };
+    });
+    const claimed = claimResult.claimed;
     if (!claimed) return null;
+
+    for (const absorbedRun of claimResult.absorbedRuns) {
+      publishLiveEvent({
+        companyId: absorbedRun.companyId,
+        type: "heartbeat.run.status",
+        payload: {
+          runId: absorbedRun.id,
+          agentId: absorbedRun.agentId,
+          status: absorbedRun.status,
+          invocationSource: absorbedRun.invocationSource,
+          triggerDetail: absorbedRun.triggerDetail,
+          error: absorbedRun.error ?? null,
+          errorCode: absorbedRun.errorCode ?? null,
+          startedAt: absorbedRun.startedAt ? new Date(absorbedRun.startedAt).toISOString() : null,
+          finishedAt: absorbedRun.finishedAt ? new Date(absorbedRun.finishedAt).toISOString() : null,
+        },
+      });
+      publishRunLifecyclePluginEvent(absorbedRun);
+    }
 
     publishLiveEvent({
       companyId: claimed.companyId,
