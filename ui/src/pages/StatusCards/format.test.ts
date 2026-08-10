@@ -30,11 +30,12 @@ function update(overrides: Partial<StatusCardUpdate>): StatusCardUpdate {
   };
 }
 
+const fixtureNow = new Date("2026-07-23T15:00:00.000Z");
+
 function iso(daysAgo: number): string {
-  const d = new Date();
-  d.setDate(d.getDate() - daysAgo);
-  // Noon avoids DST/midnight edge cases in the local-day filter.
-  d.setHours(12, 0, 0, 0);
+  const d = new Date(fixtureNow);
+  d.setUTCDate(d.getUTCDate() - daysAgo);
+  d.setUTCHours(12, 0, 0, 0);
   return d.toISOString();
 }
 
@@ -61,7 +62,7 @@ describe("rollupUpdatesToday", () => {
       // yesterday + last week — must not be counted as "today"
       update({ kind: "full", inputTokens: 9999, outputTokens: 9999, costCents: 99, startedAt: iso(1) }),
       update({ kind: "incremental", inputTokens: 9999, outputTokens: 9999, costCents: 99, startedAt: iso(7) }),
-    ]);
+    ], fixtureNow);
     // Only today's full rebuild counts as an update (compile excluded).
     expect(rollup.updateCount).toBe(1);
     // Today's tokens/cost include today's compile but not older days.
@@ -74,6 +75,18 @@ describe("rollupUpdatesToday", () => {
     const rollup = rollupUpdatesToday([
       update({ startedAt: "2026-07-23T00:30:00.000Z", inputTokens: 200, outputTokens: 50 }),
       update({ startedAt: "2026-07-22T23:30:00.000Z", inputTokens: 900, outputTokens: 100 }),
+    ], now);
+
+    expect(rollup.updateCount).toBe(1);
+    expect(rollup.totalTokens).toBe(250);
+  });
+
+  it("keeps UTC-today rows when local time is ahead of UTC", () => {
+    // Local time is already July 23 in UTC+02, while the UTC day is July 22.
+    const now = new Date("2026-07-23T00:30:00.000+02:00");
+    const rollup = rollupUpdatesToday([
+      update({ startedAt: "2026-07-22T12:00:00.000+02:00", inputTokens: 200, outputTokens: 50 }),
+      update({ startedAt: "2026-07-22T01:30:00.000+02:00", inputTokens: 900, outputTokens: 100 }),
     ], now);
 
     expect(rollup.updateCount).toBe(1);
