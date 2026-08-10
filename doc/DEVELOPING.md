@@ -253,6 +253,11 @@ pnpm test
 pnpm test:watch
 ```
 
+Database suites fail closed when embedded PostgreSQL cannot start. Set
+`PAPERCLIP_ALLOW_SKIP_EMBEDDED_POSTGRES=1` only when intentionally running those
+suites on a host that cannot provide embedded PostgreSQL; no other value enables
+the skip behavior.
+
 Browser suites stay separate:
 
 ```sh
