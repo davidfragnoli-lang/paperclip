@@ -241,6 +241,74 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .then((rows) => rows[0]!);
   }
 
+  it("replays exactly the newest pause-refused occurrence per routine once", async () => {
+    const { companyId, agentId, projectId, routine, svc } = await seedFixture();
+    const secondRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "second paused routine",
+        description: "Run the second paused routine",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+    const pausedAt = new Date("2026-08-10T10:00:00.000Z");
+    const resumedAt = new Date("2026-08-10T13:00:00.000Z");
+
+    await db.insert(routineRuns).values([
+      {
+        companyId,
+        routineId: routine.id,
+        source: "schedule",
+        status: "failed",
+        triggeredAt: new Date("2026-08-10T11:00:00.000Z"),
+        completedAt: new Date("2026-08-10T11:00:00.000Z"),
+        failureReason: "Agent is not invokable in its current state",
+        triggerPayload: { occurrence: "older" },
+      },
+      {
+        companyId,
+        routineId: routine.id,
+        source: "schedule",
+        status: "failed",
+        triggeredAt: new Date("2026-08-10T12:00:00.000Z"),
+        completedAt: new Date("2026-08-10T12:00:00.000Z"),
+        failureReason: "Agent is not invokable in its current state",
+        triggerPayload: { occurrence: "newest" },
+      },
+      {
+        companyId,
+        routineId: secondRoutine.id,
+        source: "schedule",
+        status: "failed",
+        triggeredAt: new Date("2026-08-10T12:30:00.000Z"),
+        completedAt: new Date("2026-08-10T12:30:00.000Z"),
+        failureReason: "Agent is not invokable in its current state",
+        triggerPayload: { occurrence: "second" },
+      },
+    ]);
+
+    const first = await svc.catchUpPauseRefusedRuns({ agentId, pausedAt, resumedAt });
+    const second = await svc.catchUpPauseRefusedRuns({ agentId, pausedAt, resumedAt });
+
+    expect(first).toHaveLength(2);
+    expect(second.map((run) => run.catchUpRunId).sort()).toEqual(first.map((run) => run.catchUpRunId).sort());
+    const allRuns = await db.select().from(routineRuns).where(inArray(routineRuns.routineId, [routine.id, secondRoutine.id]));
+    const catchUpRuns = allRuns.filter((run) => run.idempotencyKey?.startsWith("agent-resume-catch-up:"));
+    expect(catchUpRuns).toHaveLength(2);
+    expect(catchUpRuns.every((run) => run.status !== "failed")).toBe(true);
+    expect(catchUpRuns.find((run) => run.routineId === routine.id)?.triggerPayload).toMatchObject({
+      occurrence: "newest",
+    });
+  });
+
   it("filters listed routines by project", async () => {
     const { companyId, agentId, projectId, routine, svc } = await seedFixture();
     const otherProjectId = randomUUID();

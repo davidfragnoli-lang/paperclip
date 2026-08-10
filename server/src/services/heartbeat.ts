@@ -8343,6 +8343,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : {};
 
+    if (input.actorType !== "user") {
+      const targetAgent = await getAgent(targetAgentId);
+      const targetInvokability = await getAgentInvokability(targetAgent);
+      if (!targetInvokability.invokable) {
+        await db
+          .update(issues)
+          .set({
+            monitorWakeRequestedAt: input.now,
+            updatedAt: input.now,
+          })
+          .where(eq(issues.id, claimed.id));
+        await logActivity(db, {
+          companyId: claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_deferred_agent_not_invokable",
+          entityType: "issue",
+          entityId: claimed.id,
+          details: {
+            identifier: claimed.identifier,
+            nextCheckAt: scheduledAtIso,
+            reason: targetInvokability.reason,
+            targetAgentId,
+            source: input.activitySource,
+          },
+        });
+        return { outcome: "skipped" as const, reason: "agent.not_invokable" };
+      }
+    }
+
     if (clearReason) {
       return clearIssueMonitorAndRecover({
         claimed,
@@ -18385,7 +18417,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
-      await db.insert(agentWakeupRequests).values({
+      const now = new Date();
+      const values = {
         companyId: agent.companyId,
         agentId,
         source,
@@ -18396,9 +18429,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         requestedByActorType: opts.requestedByActorType ?? null,
         requestedByActorId: opts.requestedByActorId ?? null,
         idempotencyKey: opts.idempotencyKey ?? null,
-        finishedAt: new Date(),
+        finishedAt: now,
         ...patch,
-      });
+      } satisfies typeof agentWakeupRequests.$inferInsert;
+      if (skipReason === "agent.not_invokable" && opts.requestedByActorType !== "user") {
+        const suppressionCutoff = new Date(now.getTime() - 5 * 60 * 1000);
+        await db.transaction(async (tx) => {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`agent.not_invokable:${agent.companyId}:${agentId}`}))`);
+          const recentRefusal = await tx
+            .select({ id: agentWakeupRequests.id })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "skipped"),
+                eq(agentWakeupRequests.reason, "agent.not_invokable"),
+                gte(agentWakeupRequests.requestedAt, suppressionCutoff),
+              ),
+            )
+            .orderBy(desc(agentWakeupRequests.requestedAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (!recentRefusal) {
+            await tx.insert(agentWakeupRequests).values(values);
+          }
+        });
+        return;
+      }
+      await db.insert(agentWakeupRequests).values(values);
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
       await writeSkippedRequest(skipReason, {

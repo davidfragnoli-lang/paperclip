@@ -25,6 +25,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { agentService } from "../services/agents.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -138,6 +139,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
+    agentPausedAt?: Date | null;
     issueStatus?: "in_progress" | "in_review";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
@@ -170,6 +172,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       name: "Monitor Bot",
       role: "engineer",
       status: input?.agentStatus ?? "active",
+      pausedAt: input?.agentPausedAt ?? null,
       adapterType: "process",
       adapterConfig: {
         command: process.execPath,
@@ -384,20 +387,24 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     });
   });
 
-  it("rearms due monitors after a dispatch deferral without consuming a terminal attempt", async () => {
+  it("suspends a due monitor while paused, shifts its clock on resume, and then delivers", async () => {
     const { issueId, agentId } = await seedFixture({
       agentStatus: "paused",
-      monitor: { maxAttempts: 1 },
+      agentPausedAt: new Date("2026-04-11T12:00:00.000Z"),
+      monitor: {
+        maxAttempts: 1,
+        timeoutAt: "2026-04-11T12:35:00.000Z",
+      },
     });
     const heartbeat = heartbeatService(db);
-    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+    const tickAt = new Date("2026-04-11T12:40:00.000Z");
 
     const result = await heartbeat.tickTimers(tickAt);
 
     expect(result.skipped).toBe(1);
 
     const deferredIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
-    expect(deferredIssue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:33:30.000Z");
+    expect(deferredIssue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:30:00.000Z");
     expect(deferredIssue.monitorAttemptCount).toBe(0);
     expect(parseIssueExecutionState(deferredIssue.executionState)?.monitor).toMatchObject({
       status: "scheduled",
@@ -409,15 +416,17 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .select()
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId));
-    expect(deferredActivity.map((row) => row.action)).toContain("issue.monitor_skipped");
-    expect(deferredActivity.find((row) => row.action === "issue.monitor_skipped")?.details).toMatchObject({
-      attemptedAttemptCount: 1,
-      restoredAttemptCount: 0,
-      terminalAttemptConsumed: false,
-    });
+    expect(deferredActivity.map((row) => row.action)).toContain("issue.monitor_deferred_agent_not_invokable");
+    expect(parseIssueExecutionState(deferredIssue.executionState)?.monitor?.clearReason).toBeNull();
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
 
-    await db.update(agents).set({ status: "active" }).where(eq(agents.id, agentId));
-    const delivered = await heartbeat.tickTimers(new Date("2026-04-11T12:34:00.000Z"));
+    await agentService(db).resume(agentId, { now: new Date("2026-04-11T13:00:00.000Z") });
+
+    const resumedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(resumedIssue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T13:30:00.000Z");
+    expect(normalizeIssueExecutionPolicy(resumedIssue.executionPolicy)?.monitor?.timeoutAt).toBe("2026-04-11T13:35:00.000Z");
+
+    const delivered = await heartbeat.tickTimers(new Date("2026-04-11T13:31:00.000Z"));
 
     expect(delivered.enqueued).toBe(1);
     const deliveredIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
@@ -428,6 +437,43 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       attemptCount: 1,
       maxAttempts: 1,
     });
+  });
+
+  it("bounds automated non-invokable refusal rows while user wakes still fail loudly", async () => {
+    const { agentId } = await seedFixture({
+      agentStatus: "paused",
+      agentPausedAt: new Date("2026-04-11T12:00:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    await Promise.all(Array.from({ length: 30 }, async () => {
+      await expect(heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "bounded-refusal-test",
+        requestedByActorType: "system",
+        requestedByActorId: "test-scheduler",
+      })).rejects.toMatchObject({ status: 409 });
+    }));
+
+    const automatedRefusals = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(automatedRefusals).toHaveLength(1);
+    expect(automatedRefusals[0]).toMatchObject({
+      status: "skipped",
+      reason: "agent.not_invokable",
+    });
+
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "user-wake-test",
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    })).rejects.toMatchObject({ status: 409 });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
   });
 
   it("clears exhausted monitors and queues bounded owner recovery instead of another due check", async () => {

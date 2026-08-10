@@ -1230,6 +1230,57 @@ export function buildIssueMonitorRearmedPatch(input: {
   };
 }
 
+export function buildIssueMonitorPauseShiftPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  pausedAt: Date;
+  resumedAt: Date;
+}) {
+  const pausedDurationMs = Math.max(0, input.resumedAt.getTime() - input.pausedAt.getTime());
+  if (pausedDurationMs === 0 || !input.issue.monitorNextCheckAt) return {};
+
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  if (!currentMonitorState) return {};
+
+  const shiftedNextCheckAt = new Date(input.issue.monitorNextCheckAt.getTime() + pausedDurationMs);
+  const policyMonitor = input.policy?.monitor ?? null;
+  const timeoutAt = policyMonitor?.timeoutAt ?? currentMonitorState.timeoutAt;
+  const currentTimeoutAt = timeoutAt ? new Date(timeoutAt) : null;
+  const shiftedTimeoutAt = currentTimeoutAt && !Number.isNaN(currentTimeoutAt.getTime())
+    ? new Date(currentTimeoutAt.getTime() + pausedDurationMs).toISOString()
+    : null;
+  const scheduledBy = currentMonitorState.scheduledBy === "board" ? "board" : "assignee";
+  const shiftedMonitor: IssueExecutionMonitorPolicy = {
+    nextCheckAt: shiftedNextCheckAt.toISOString(),
+    notes: policyMonitor?.notes ?? currentMonitorState.notes ?? null,
+    scheduledBy,
+    kind: policyMonitor?.kind ?? currentMonitorState.kind ?? null,
+    serviceName: policyMonitor?.serviceName ?? currentMonitorState.serviceName ?? null,
+    externalRef: policyMonitor?.externalRef ?? currentMonitorState.externalRef ?? null,
+    timeoutAt: shiftedTimeoutAt,
+    maxAttempts: currentMonitorState.maxAttempts ?? null,
+    recoveryPolicy: currentMonitorState.recoveryPolicy ?? null,
+  };
+  const basePolicy = input.policy ?? { mode: "normal" as const, commentRequired: true, stages: [] };
+  const nextMonitorState = buildScheduledMonitorState(currentMonitorState, shiftedMonitor);
+
+  return {
+    executionPolicy: { ...basePolicy, monitor: shiftedMonitor } as Record<string, unknown>,
+    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    monitorNextCheckAt: shiftedNextCheckAt,
+    monitorWakeRequestedAt: null,
+    monitorLastTriggeredAt: currentMonitorState.lastTriggeredAt ? new Date(currentMonitorState.lastTriggeredAt) : null,
+    monitorAttemptCount: currentMonitorState.attemptCount,
+    monitorNotes: nextMonitorState.notes,
+    monitorScheduledBy: nextMonitorState.scheduledBy,
+  };
+}
+
 export function buildIssueMonitorClearedPatch(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
