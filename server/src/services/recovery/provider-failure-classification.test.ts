@@ -90,6 +90,10 @@ const NON_ADAPTER_FAILURE_ERROR_CODE_EXCLUSIONS: ReadonlyMap<string, string> = n
     "lock_released_on_reassignment",
     "The execution lock was released after reassignment; board lifecycle owns the outcome.",
   ],
+  [
+    "hot_restart_adopted_run_deadline",
+    "The hot-restart reaper terminates the adopted process and queues its process-loss retry; runtime lifecycle owns recovery.",
+  ],
   ["process_detached", "The local process detached successfully; runtime lifecycle owns the outcome."],
   ["server_shutdown_interrupted", "The server interrupted the run during shutdown; runtime lifecycle owns the outcome."],
   ["workspace_busy", "Shared-workspace contention is a scheduled deferral, not an adapter failure."],
@@ -454,6 +458,16 @@ describe("classifyAdapterFailureForRecovery", () => {
         resultJson: null,
       })).toEqual({ kind: "transient_infra" });
     }
+  });
+
+  it("explicitly excludes runtime-owned adopted-run deadline recovery", () => {
+    expect(NON_ADAPTER_FAILURE_ERROR_CODE_EXCLUSIONS.get("hot_restart_adopted_run_deadline"))
+      .toContain("runtime lifecycle owns recovery");
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "hot_restart_adopted_run_deadline",
+      error: "Hot-restart adopted run exceeded its absolute post-adoption deadline",
+      resultJson: null,
+    })).toBeNull();
   });
 
   it("source-derives emitted failure codes and requires classification or explicit exclusion", () => {
