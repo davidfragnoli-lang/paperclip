@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -1990,6 +1990,50 @@ export function routineService(
     evaluateActivityGate,
     get: getRoutineById,
     getTrigger: getTriggerById,
+
+    catchUpPauseRefusedRuns: async (input: {
+      agentId: string;
+      pausedAt: Date;
+      resumedAt: Date;
+    }) => {
+      const missedRuns = await db
+        .selectDistinctOn([routineRuns.routineId], {
+          routine: routines,
+          failedRunId: routineRuns.id,
+          triggerPayload: routineRuns.triggerPayload,
+        })
+        .from(routineRuns)
+        .innerJoin(routines, eq(routines.id, routineRuns.routineId))
+        .where(
+          and(
+            eq(routines.assigneeAgentId, input.agentId),
+            eq(routines.status, "active"),
+            eq(routineRuns.status, "failed"),
+            eq(routineRuns.failureReason, "Agent is not invokable in its current state"),
+            gte(routineRuns.triggeredAt, input.pausedAt),
+            lte(routineRuns.triggeredAt, input.resumedAt),
+          ),
+        )
+        .orderBy(routineRuns.routineId, desc(routineRuns.triggeredAt), desc(routineRuns.id));
+
+      const results = [];
+      for (const missed of missedRuns) {
+        const run = await dispatchRoutineRun({
+          routine: missed.routine,
+          trigger: null,
+          source: "api",
+          payload: missed.triggerPayload as Record<string, unknown> | null,
+          idempotencyKey: `agent-resume-catch-up:${input.agentId}:${input.pausedAt.toISOString()}:${missed.routine.id}`,
+        });
+        results.push({
+          routineId: missed.routine.id,
+          failedRunId: missed.failedRunId,
+          catchUpRunId: run.id,
+          status: run.status,
+        });
+      }
+      return results;
+    },
 
     list: async (
       companyId: string,
