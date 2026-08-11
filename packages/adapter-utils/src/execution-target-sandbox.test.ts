@@ -655,7 +655,7 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
-  it("preserves sandbox process session stdin ordering when an earlier remote write is delayed", async () => {
+  it("publishes ordered sandbox process session stdin only after each remote write is complete", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-ordered-"));
     cleanupDirs.push(rootDir);
     const childPath = path.join(rootDir, "ordered-acp-child.mjs");
@@ -668,11 +668,23 @@ describe("sandbox adapter execution targets", () => {
     );
 
     const delegate = createLocalSandboxRunner();
+    let finalizeDelayed = false;
     const runner = {
       execute: async (input: Parameters<typeof delegate.execute>[0]) => {
         const script = (input.args ?? []).join("\n");
-        if (/\/stdin\/000000000001\.json/.test(script)) {
-          await new Promise((resolve) => setTimeout(resolve, 300));
+        if (/\/stdin\/000000000001\.json/.test(script) && script.includes("base64 -d <")) {
+          finalizeDelayed = true;
+          // Stretch the interval between opening the decode destination and
+          // writing its bytes. A direct decode into the queue-visible path lets
+          // the remote poller consume an empty file; decoding to a temporary
+          // sibling and renaming it after completion keeps the payload atomic.
+          const args = (input.args ?? []).map((arg) =>
+            arg.replace(
+              /base64 -d < (.+?) > (.+?) &&/,
+              "{ sleep 0.3; base64 -d < $1; } > $2 &&",
+            ),
+          );
+          return delegate.execute({ ...input, args });
         }
         return delegate.execute(input);
       },
@@ -702,6 +714,7 @@ describe("sandbox adapter execution targets", () => {
 
     try {
       const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+      expect(finalizeDelayed).toBe(true);
       expect(result.code).toBe(0);
       expect(result.stdout).toBe("hello\n");
     } finally {
