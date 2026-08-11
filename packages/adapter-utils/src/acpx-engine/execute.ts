@@ -85,12 +85,14 @@ import {
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "./constants.js";
 import {
+  createRuntimeSpanRunner,
   emitSkippedStartupStep,
   measureStartupStep,
   NOOP_STARTUP_SPAN,
   NOOP_STARTUP_TRACE_CONTEXT,
   runWithRuntimeParent,
   setSandboxRootSpanAttributes,
+  type RuntimeSpanRunner,
   type SandboxRootSpanContext,
   type StartupSpan,
   type StartupSpanContext,
@@ -1368,6 +1370,12 @@ async function buildRuntime(input: {
   // run closure passes the run-scoped getter here; when it is absent, each
   // bridge site keeps its earlier unparented run-time behavior.
   getRuntimeParentContext?: () => StartupSpanContext | undefined;
+  // Wrap each unit of bridge run-time work in its own named span.
+  // `buildRuntime` threads it into the two remote bridge factories, so the
+  // socket handler, the poll loop, and the callback worker each open a wrapper
+  // span per unit of work. The run closure passes the run-scoped runner here;
+  // when it is absent, each bridge site opens no wrapper span.
+  runtimeSpan?: RuntimeSpanRunner;
 }): Promise<AcpxPreparedRuntime> {
   const { runId, agent, config, context, authToken } = input.ctx;
   // Injectable monotonic clock for per-step startup timing. Hoisted above the
@@ -1964,6 +1972,7 @@ async function buildRuntime(input: {
           hostApiToken: env.PAPERCLIP_API_KEY,
           onLog: input.ctx.onLog,
           getRuntimeParentContext: input.getRuntimeParentContext,
+          runtimeSpan: input.runtimeSpan,
         }),
         concurrentBridgeStepMetrics,
       );
@@ -1995,6 +2004,7 @@ async function buildRuntime(input: {
           timeoutSec,
           onLog: input.ctx.onLog,
           getRuntimeParentContext: input.getRuntimeParentContext,
+          runtimeSpan: input.runtimeSpan,
         }),
         concurrentBridgeStepMetrics,
       );
@@ -3146,6 +3156,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     // reads it through `getRuntimeParentContext` to parent to the live span.
     let currentRunParentContext: StartupSpanContext | undefined = runRootSpan.parentContext;
     const getRuntimeParentContext = (): StartupSpanContext | undefined => currentRunParentContext;
+    // Wrap each unit of bridge run-time work (one outbound ACP message, one poll
+    // tick, one callback request) in its own named span, parented to the live run
+    // span. The runner reads the run parent per call through
+    // `getRuntimeParentContext`, so a wrapper span always parents to the current
+    // run span. On a no-op trace context the runner opens no real span.
+    const runRuntimeSpan = createRuntimeSpanRunner(tracing, getRuntimeParentContext);
     // `runFailed` marks the run root span status at end time. It stays `true`
     // until the run reaches a clean completed turn, so every failure and every
     // early exit closes the span with error status.
@@ -3205,7 +3221,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // parents to its step span. On a local or SSH target
         // `spanParent.parentContext` is a no-op token, so the wrap is inert.
         prepared = await runWithRuntimeParent(spanParent.parentContext, () =>
-          buildRuntime({ ctx, engine, deps, spanParent, getRuntimeParentContext }),
+          buildRuntime({ ctx, engine, deps, spanParent, getRuntimeParentContext, runtimeSpan: runRuntimeSpan }),
         );
       } catch (err) {
         rootSpan.end(true);
