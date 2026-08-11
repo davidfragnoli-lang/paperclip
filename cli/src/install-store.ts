@@ -286,11 +286,7 @@ export function flipCurrentAtomic(
     hooks.beforeRename?.();
     fs.renameSync(temporaryLink, paths.currentPath);
   } finally {
-    try {
-      fs.unlinkSync(temporaryLink);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+    fs.rmSync(temporaryLink, { force: true });
   }
 }
 
