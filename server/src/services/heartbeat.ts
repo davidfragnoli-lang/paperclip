@@ -253,6 +253,45 @@ import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
+
+export function createRestartDrainAdmissionGate() {
+  let quiesced = false;
+  const activeAdmissions = new Set<Promise<void>>();
+
+  return {
+    async run<T>(operation: () => Promise<T>, quiescedValue: () => T): Promise<T> {
+      if (quiesced) return quiescedValue();
+
+      const result = Promise.resolve().then(operation);
+      const marker = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      activeAdmissions.add(marker);
+      try {
+        return await result;
+      } finally {
+        activeAdmissions.delete(marker);
+      }
+    },
+
+    async quiesce() {
+      quiesced = true;
+      let drainedAdmissions = 0;
+      while (activeAdmissions.size > 0) {
+        const current = [...activeAdmissions];
+        drainedAdmissions += current.length;
+        await Promise.allSettled(current);
+      }
+      return { quiesced: true as const, drainedAdmissions };
+    },
+
+    resume() {
+      quiesced = false;
+      return { quiesced: false as const };
+    },
+  };
+}
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -6809,6 +6848,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // enabled and pause only this service instance's claims so the replacement
   // server can resume the queued row during startup recovery.
   let runDispatchQuiescedForShutdown = false;
+  const restartDrainAdmissionGate = createRestartDrainAdmissionGate();
   const quiesceRunDispatchForShutdown = () => {
     runDispatchQuiescedForShutdown = true;
   };
@@ -14722,7 +14762,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
 
-    return withAgentStartLock(agentId, async () => {
+    return restartDrainAdmissionGate.run(() => withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -14808,7 +14848,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
       return claimedRuns;
-    });
+    }), () => []);
   }
 
   // Await every background heartbeat execution that is currently in flight. A
@@ -20322,6 +20362,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reportRunActivity: clearDetachedRunWarning,
 
     quiesceRunDispatchForShutdown,
+    quiesceRunDispatchForRestartDrain: restartDrainAdmissionGate.quiesce,
+    resumeRunDispatchAfterRestartDrain: restartDrainAdmissionGate.resume,
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,

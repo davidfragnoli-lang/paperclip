@@ -969,6 +969,10 @@ export async function startServer(): Promise<StartedServer> {
     decisionServiceOptions,
     managedPluginAutoInstall,
   });
+  if (heartbeat) {
+    app.locals.paperclipRestartDrainQuiesce = heartbeat.quiesceRunDispatchForRestartDrain;
+    app.locals.paperclipRestartDrainResume = heartbeat.resumeRunDispatchAfterRestartDrain;
+  }
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
   // Increase keep-alive timeouts to safely outlive default idle timeouts
