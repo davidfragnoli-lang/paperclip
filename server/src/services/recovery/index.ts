@@ -60,8 +60,22 @@ export {
   isSuccessfulRunHandoffInsideSettleWindow,
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
+  noticeMetadataReferencesRecoveryAction,
 } from "./successful-run-handoff.js";
 export type {
   SuccessfulRunHandoffNotice,
   SuccessfulRunHandoffDecision,
 } from "./successful-run-handoff.js";
+export {
+  DEFAULT_STRANDED_RECOVERY_NOTICE_BODY,
+  buildConfigurationIncompleteRecoveryNoticeSeed,
+  buildExecutionReviewParticipantRecoveryNoticeSeed,
+  buildExecutionReviewParticipantUnavailableNoticeSeed,
+  buildImmediateExecutionPathRecoveryNoticeSeed,
+  buildStrandedRecoveryEscalationNotice,
+  buildWorkspaceValidationRecoveryNoticeSeed,
+} from "./stranded-notice.js";
+export type {
+  StrandedRecoveryEscalationNotice,
+  StrandedRecoveryNoticeSeed,
+} from "./stranded-notice.js";
