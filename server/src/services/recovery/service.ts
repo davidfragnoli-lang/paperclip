@@ -4760,7 +4760,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             notice: {
               body:
                 "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
-                `but it still has no live execution path.${failureSummary ?? ""} ` +
+                "but it still has no live execution path. " +
                 "Moving it to `blocked` so it is visible for intervention.",
               title: "No live execution path",
               tone: "danger",
@@ -4936,7 +4936,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               notice: {
                 body:
                   "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
-                  `execution disappeared, but it still has no live execution path${attemptCopy}.${causeCopy}${failureSummary ?? ""} ` +
+                  `execution disappeared, but it still has no live execution path${attemptCopy}. ` +
                   "Moving it to `blocked` so it is visible for intervention.",
                 title: "No live execution path",
                 tone: "danger",

@@ -5662,7 +5662,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       comments.some(
         (comment) =>
           comment.body.includes("suppression is capped") &&
-          comment.body.includes(`Recovery action: \`${recoveryAction.id}\``),
+          commentMetadataRows(comment).some(
+            (row) => row.label === "Recovery action" && row.value === recoveryAction.id,
+          ),
       ),
     ).toBe(true);
   });
