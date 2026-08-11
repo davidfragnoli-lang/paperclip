@@ -655,6 +655,60 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it("preserves sandbox process session stdin ordering when an earlier remote write is delayed", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-ordered-"));
+    cleanupDirs.push(rootDir);
+    const childPath = path.join(rootDir, "ordered-acp-child.mjs");
+    await writeFile(
+      childPath,
+      [
+        "process.stdin.on('data', (chunk) => process.stdout.write(chunk));",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const delegate = createLocalSandboxRunner();
+    const runner = {
+      execute: async (input: Parameters<typeof delegate.execute>[0]) => {
+        const script = (input.args ?? []).join("\n");
+        if (/\/stdin\/000000000001\.json/.test(script)) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+        return delegate.execute(input);
+      },
+    };
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: 30_000,
+      runner,
+    };
+
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-process-session-ordered",
+      target,
+      runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+      adapterKey: "acpx",
+      command: process.execPath,
+      args: [childPath],
+      cwd: rootDir,
+      env: {},
+      timeoutSec: 5,
+      onLog: async () => {},
+    });
+    expect(bridge).not.toBeNull();
+
+    try {
+      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe("hello\n");
+    } finally {
+      await bridge?.stop();
+    }
+  });
+
   it("buffers sandbox process session output until the local proxy connects", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-buffer-"));
     cleanupDirs.push(rootDir);

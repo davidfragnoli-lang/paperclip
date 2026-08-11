@@ -1878,6 +1878,7 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
   let socket: net.Socket | null = null;
   let stopping = false;
   let stdinSeq = 0;
+  let stdinWriteChain: Promise<void> = Promise.resolve();
   let pollTimer: NodeJS.Timeout | null = null;
   const pendingRemoteEvents: Array<{
     type?: string;
@@ -1988,9 +1989,15 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
         if (stdinPayload) {
           stdinSeq += 1;
           const name = `${String(stdinSeq).padStart(12, "0")}.json`;
-          void runRuntimeWork(AGENT_SESSION_SEND_INPUT_SPAN, () =>
-            client.writeTextFile(path.posix.join(stdinDir, name), jsonLine(stdinPayload)),
-          ).catch((error) => {
+          // The remote poller can observe a later file before an earlier async
+          // upload finishes. Serialize writes so stdinEnd never overtakes data.
+          const write = stdinWriteChain.then(() =>
+            runRuntimeWork(AGENT_SESSION_SEND_INPUT_SPAN, () =>
+              client.writeTextFile(path.posix.join(stdinDir, name), jsonLine(stdinPayload)),
+            ),
+          );
+          stdinWriteChain = write.catch(() => undefined);
+          void write.catch((error) => {
             nextSocket.write(jsonLine({ type: "error", message: error instanceof Error ? error.message : String(error) }));
             nextSocket.destroy();
           });
