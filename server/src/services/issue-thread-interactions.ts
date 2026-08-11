@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, ne } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -145,6 +145,18 @@ const MERGE_CONFIRMATION_ALLOWED_WORDS = new Set([
   "to",
   "url",
 ]);
+
+const SINGLE_OPEN_DECISION_SURFACE_KINDS = [
+  "request_confirmation",
+  "request_checkbox_confirmation",
+  "request_item_verdicts",
+] as const satisfies readonly IssueThreadInteractionKind[];
+
+function isSingleOpenDecisionSurfaceKind(
+  kind: IssueThreadInteractionKind,
+): kind is (typeof SINGLE_OPEN_DECISION_SURFACE_KINDS)[number] {
+  return (SINGLE_OPEN_DECISION_SURFACE_KINDS as readonly IssueThreadInteractionKind[]).includes(kind);
+}
 
 function isMergeConfirmationOnlyText(value: string) {
   GITHUB_PULL_REQUEST_URL_PATTERN.lastIndex = 0;
@@ -557,7 +569,20 @@ function buildStaleTargetResult(
   } as const;
 }
 
-function buildSupersededByNewerRequestResult(replacementInteractionId: string) {
+function buildSupersededByNewerDecisionSurfaceResult(
+  row: IssueThreadInteractionRow,
+  replacementInteractionId: string,
+) {
+  if (row.kind === "request_item_verdicts") {
+    const interaction = hydrateInteraction(row) as RequestItemVerdictsInteraction;
+    return {
+      version: 1,
+      outcome: "cancelled",
+      complete: false,
+      items: interaction.result?.items ?? [],
+      reason: `Superseded by newer decision surface ${replacementInteractionId}`,
+    } satisfies RequestItemVerdictsResult;
+  }
   return {
     version: 1,
     outcome: "superseded_by_newer_request",
@@ -1665,21 +1690,24 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
     sweepSupersededPendingRequestConfirmations: async () => {
       const rows = await db
-        .select()
+        .select({ interaction: issueThreadInteractions })
         .from(issueThreadInteractions)
+        .innerJoin(issues, and(
+          eq(issues.id, issueThreadInteractions.issueId),
+          eq(issues.companyId, issueThreadInteractions.companyId),
+        ))
         .where(and(
-          eq(issueThreadInteractions.kind, "request_confirmation"),
+          inArray(issueThreadInteractions.kind, SINGLE_OPEN_DECISION_SURFACE_KINDS),
           eq(issueThreadInteractions.status, "pending"),
-          isNotNull(issueThreadInteractions.createdByAgentId),
+          notInArray(issues.status, ["done", "cancelled"]),
         ))
         .orderBy(
           asc(issueThreadInteractions.companyId),
           asc(issueThreadInteractions.issueId),
-          asc(issueThreadInteractions.kind),
-          asc(issueThreadInteractions.createdByAgentId),
           desc(issueThreadInteractions.createdAt),
           desc(issueThreadInteractions.id),
-        );
+        )
+        .then((joinedRows) => joinedRows.map(({ interaction }) => interaction));
 
       const newestByGroup = new Map<string, IssueThreadInteractionRow>();
       const supersededRows: Array<{
@@ -1687,8 +1715,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
         replacementInteractionId: string;
       }> = [];
       for (const row of rows) {
-        if (!row.createdByAgentId) continue;
-        const groupKey = `${row.companyId}:${row.issueId}:${row.kind}:${row.createdByAgentId}`;
+        const groupKey = `${row.companyId}:${row.issueId}`;
         const newest = newestByGroup.get(groupKey);
         if (!newest) {
           newestByGroup.set(groupKey, row);
@@ -1707,7 +1734,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
             .update(issueThreadInteractions)
             .set({
               status: "expired",
-              result: buildSupersededByNewerRequestResult(replacementInteractionId),
+              result: buildSupersededByNewerDecisionSurfaceResult(row, replacementInteractionId),
               resolvedByAgentId: null,
               resolvedByUserId: null,
               resolvedAt: now,
@@ -1867,6 +1894,40 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
               lockForUpdate: true,
             });
           }
+
+          const pendingDecisionSurfaces = isSingleOpenDecisionSurfaceKind(data.kind)
+            ? await tx
+                .select({
+                  id: issueThreadInteractions.id,
+                  kind: issueThreadInteractions.kind,
+                  createdByAgentId: issueThreadInteractions.createdByAgentId,
+                })
+                .from(issueThreadInteractions)
+                .where(and(
+                  eq(issueThreadInteractions.companyId, issue.companyId),
+                  eq(issueThreadInteractions.issueId, issue.id),
+                  inArray(issueThreadInteractions.kind, SINGLE_OPEN_DECISION_SURFACE_KINDS),
+                  eq(issueThreadInteractions.status, "pending"),
+                ))
+                .orderBy(desc(issueThreadInteractions.createdAt), desc(issueThreadInteractions.id))
+            : [];
+          const mayReplaceSameAgentConfirmations =
+            data.kind === "request_confirmation"
+            && Boolean(actor.agentId)
+            && pendingDecisionSurfaces.every((interaction) =>
+              interaction.kind === "request_confirmation"
+              && interaction.createdByAgentId === actor.agentId
+            );
+          if (pendingDecisionSurfaces.length > 0 && !mayReplaceSameAgentConfirmations) {
+            const incumbent = pendingDecisionSurfaces[0]!;
+            throw conflict("Issue already has a pending decision surface", {
+              incumbentInteractionId: incumbent.id,
+              incumbentKind: incumbent.kind,
+              incumbentCreatedByAgentId: incumbent.createdByAgentId,
+              pendingDecisionSurfaceIds: pendingDecisionSurfaces.map((interaction) => interaction.id),
+            });
+          }
+
           const [row] = await tx
             .insert(issueThreadInteractions)
             .values({
@@ -1889,7 +1950,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
             })
             .returning();
 
-          if (data.kind !== "request_confirmation" || !actor.agentId) {
+          if (!mayReplaceSameAgentConfirmations || pendingDecisionSurfaces.length === 0) {
             return { row, supersededRows: [] };
           }
 
@@ -1898,19 +1959,18 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
             .update(issueThreadInteractions)
             .set({
               status: "expired",
-              result: buildSupersededByNewerRequestResult(row.id),
+              result: buildSupersededByNewerDecisionSurfaceResult(row, row.id),
               resolvedByAgentId: actor.agentId,
               resolvedByUserId: actor.userId ?? null,
               resolvedAt: now,
               updatedAt: now,
             })
             .where(and(
-              eq(issueThreadInteractions.companyId, issue.companyId),
-              eq(issueThreadInteractions.issueId, issue.id),
-              eq(issueThreadInteractions.kind, data.kind),
-              eq(issueThreadInteractions.createdByAgentId, actor.agentId),
+              inArray(
+                issueThreadInteractions.id,
+                pendingDecisionSurfaces.map((interaction) => interaction.id),
+              ),
               eq(issueThreadInteractions.status, "pending"),
-              ne(issueThreadInteractions.id, row.id),
             ))
             .returning();
           for (const supersededRow of supersededRows) {

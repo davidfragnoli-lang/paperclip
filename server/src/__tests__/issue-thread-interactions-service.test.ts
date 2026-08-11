@@ -20,6 +20,7 @@ import {
   projects,
   workspaceOperations,
 } from "@paperclipai/db";
+import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -1194,7 +1195,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.idempotencyKey).toBe("run-1:questionnaire");
   });
 
-  it("supersedes older pending confirmations from the same agent without crossing agent or kind", async () => {
+  it("supersedes same-agent confirmations but rejects cross-agent and cross-kind decision surfaces", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Newer confirmation supersedes older");
     const firstAgentId = randomUUID();
     const secondAgentId = randomUUID();
@@ -1228,7 +1229,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       idempotencyKey: "confirmation:first:older",
       payload: { version: 1, prompt: "Approve the older draft?" },
     }, { agentId: firstAgentId });
-    const otherKind = await interactionsSvc.create({ id: issueId, companyId }, {
+    await expect(interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_checkbox_confirmation",
       idempotencyKey: "checkbox:first",
       payload: {
@@ -1236,12 +1237,18 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         prompt: "Select regions",
         options: [{ id: "us", label: "US" }],
       },
-    }, { agentId: firstAgentId });
-    const otherAgent = await interactionsSvc.create({ id: issueId, companyId }, {
+    }, { agentId: firstAgentId })).rejects.toMatchObject({
+      status: 409,
+      details: { incumbentInteractionId: older.id },
+    });
+    await expect(interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
       idempotencyKey: "confirmation:second",
       payload: { version: 1, prompt: "Approve the second agent's draft?" },
-    }, { agentId: secondAgentId });
+    }, { agentId: secondAgentId })).rejects.toMatchObject({
+      status: 409,
+      details: { incumbentInteractionId: older.id },
+    });
     const replacement = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
       idempotencyKey: "confirmation:first:newer",
@@ -1258,11 +1265,56 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     });
     expect(interactions.find((interaction) => interaction.id === replacement.id)?.status).toBe("pending");
-    expect(interactions.find((interaction) => interaction.id === otherAgent.id)?.status).toBe("pending");
-    expect(interactions.find((interaction) => interaction.id === otherKind.id)?.status).toBe("pending");
+    expect(interactions.filter((interaction) => interaction.status === "pending")).toHaveLength(1);
   });
 
-  it("sweeps historical confirmation pile-ups idempotently per issue, kind, and agent", async () => {
+  it.each([
+    ["request_confirmation", { version: 1, prompt: "Confirm?" }],
+    ["request_checkbox_confirmation", {
+      version: 1,
+      prompt: "Select one",
+      options: [{ id: "one", label: "One" }],
+    }],
+    ["request_item_verdicts", {
+      version: 1,
+      prompt: "Review one",
+      items: [{ id: "one", label: "One" }],
+      verdicts: ["approve", "reject"],
+    }],
+  ] as const)("rejects a new surface when a user-created %s is pending", async (kind, payload) => {
+    const { companyId, issueId } = await seedConfirmationIssue(`User-created ${kind}`);
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const incumbent = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind,
+      payload,
+    } as CreateIssueThreadInteraction, { userId: "local-board" });
+
+    await expect(interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      payload: { version: 1, prompt: "Agent follow-up?" },
+    }, { agentId })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        incumbentInteractionId: incumbent.id,
+        incumbentKind: kind,
+        incumbentCreatedByAgentId: null,
+      },
+    });
+  });
+
+  it("sweeps historical decision-surface pile-ups idempotently per issue across kinds and creators", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Historical confirmation sweep");
     const firstAgentId = randomUUID();
     const secondAgentId = randomUUID();
@@ -1294,6 +1346,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const firstAgentIds = [randomUUID(), randomUUID(), randomUUID()];
     const secondAgentIds = [randomUUID(), randomUUID()];
     const checkboxId = randomUUID();
+    const itemVerdictsId = randomUUID();
+    const survivorId = randomUUID();
     await db.insert(issueThreadInteractions).values([
       ...firstAgentIds.map((id, index) => ({
         id,
@@ -1331,10 +1385,40 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         createdAt: new Date("2026-07-01T14:00:00.000Z"),
         updatedAt: new Date("2026-07-01T14:00:00.000Z"),
       },
+      {
+        id: itemVerdictsId,
+        companyId,
+        issueId,
+        kind: "request_item_verdicts",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: null,
+        createdByUserId: "local-board",
+        payload: {
+          version: 1,
+          prompt: "Review one",
+          items: [{ id: "one", label: "One" }],
+          verdicts: ["approve", "reject"],
+        },
+        createdAt: new Date("2026-07-01T15:00:00.000Z"),
+        updatedAt: new Date("2026-07-01T15:00:00.000Z"),
+      },
+      {
+        id: survivorId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: secondAgentId,
+        payload: { version: 1, prompt: "Newest decision surface" },
+        createdAt: new Date("2026-07-01T16:00:00.000Z"),
+        updatedAt: new Date("2026-07-01T16:00:00.000Z"),
+      },
     ]);
 
     await expect(interactionsSvc.sweepSupersededPendingRequestConfirmations())
-      .resolves.toEqual({ expired: 3 });
+      .resolves.toEqual({ expired: 7 });
     await expect(interactionsSvc.sweepSupersededPendingRequestConfirmations())
       .resolves.toEqual({ expired: 0 });
 
@@ -1344,20 +1428,38 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         status: "expired",
         result: {
           outcome: "superseded_by_newer_request",
-          supersededByInteractionId: firstAgentIds.at(-1),
+          supersededByInteractionId: survivorId,
         },
       });
     }
-    expect(interactions.find((interaction) => interaction.id === firstAgentIds.at(-1))?.status).toBe("pending");
+    expect(interactions.find((interaction) => interaction.id === firstAgentIds.at(-1))).toMatchObject({
+      status: "expired",
+      result: { supersededByInteractionId: survivorId },
+    });
     expect(interactions.find((interaction) => interaction.id === secondAgentIds[0])).toMatchObject({
       status: "expired",
       result: {
         outcome: "superseded_by_newer_request",
-        supersededByInteractionId: secondAgentIds[1],
+        supersededByInteractionId: survivorId,
       },
     });
-    expect(interactions.find((interaction) => interaction.id === secondAgentIds[1])?.status).toBe("pending");
-    expect(interactions.find((interaction) => interaction.id === checkboxId)?.status).toBe("pending");
+    expect(interactions.find((interaction) => interaction.id === secondAgentIds[1])).toMatchObject({
+      status: "expired",
+      result: { supersededByInteractionId: survivorId },
+    });
+    expect(interactions.find((interaction) => interaction.id === checkboxId)).toMatchObject({
+      status: "expired",
+      result: { supersededByInteractionId: survivorId },
+    });
+    expect(interactions.find((interaction) => interaction.id === itemVerdictsId)).toMatchObject({
+      status: "expired",
+      result: {
+        outcome: "cancelled",
+        complete: false,
+        reason: `Superseded by newer decision surface ${survivorId}`,
+      },
+    });
+    expect(interactions.find((interaction) => interaction.id === survivorId)?.status).toBe("pending");
   });
 
   it("refuses to create an interaction on a closed issue", async () => {
@@ -1556,6 +1658,16 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       .set({ createdByAgentId: resolverAgentId })
       .where(eq(issueThreadInteractions.id, createdByResolver.id));
 
+    const issue = { id: issueId, companyId, goalId, projectId: null };
+    const actor = {
+      agentId: resolverAgentId,
+      runId: resolverRunId,
+      reviewVerdictAuthorized: true,
+    };
+    await expect(interactionsSvc.acceptInteraction(issue, createdByResolver.id, {}, actor))
+      .rejects.toThrow("Agents cannot resolve interactions they created");
+
+    await interactionsSvc.withdrawInteraction(issue, createdByResolver.id, {}, { userId: "local-board" });
     const createdBySameRun = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_checkbox_confirmation",
       payload: {
@@ -1570,14 +1682,6 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       .set({ sourceRunId: resolverRunId })
       .where(eq(issueThreadInteractions.id, createdBySameRun.id));
 
-    const issue = { id: issueId, companyId, goalId, projectId: null };
-    const actor = {
-      agentId: resolverAgentId,
-      runId: resolverRunId,
-      reviewVerdictAuthorized: true,
-    };
-    await expect(interactionsSvc.acceptInteraction(issue, createdByResolver.id, {}, actor))
-      .rejects.toThrow("Agents cannot resolve interactions they created");
     await expect(interactionsSvc.acceptInteraction(issue, createdBySameRun.id, {
       selectedOptionIds: ["approve"],
     }, actor)).rejects.toThrow("Agents cannot resolve interactions created by the same run");
