@@ -6135,6 +6135,22 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "post",
+  path: "/api/health/restart-drain/quiesce",
+  tags: ["health"],
+  summary: "Quiesce new agent-run admissions and wait for admitted starts to drain",
+  responses: { 200: r.ok(), 403: r.forbidden, 503: { description: "Heartbeat scheduler unavailable" } },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/health/restart-drain/resume",
+  tags: ["health"],
+  summary: "Resume agent-run admissions after an aborted restart drain",
+  responses: { 200: r.ok(), 403: r.forbidden, 503: { description: "Heartbeat scheduler unavailable" } },
+});
+
+registerCurrentRoute({
+  method: "post",
   path: "/api/bootstrap/claim",
   tags: ["access"],
   summary: "Claim first instance admin from a browser session",
