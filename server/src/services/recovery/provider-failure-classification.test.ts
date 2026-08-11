@@ -91,6 +91,10 @@ const NON_ADAPTER_FAILURE_ERROR_CODE_EXCLUSIONS: ReadonlyMap<string, string> = n
     "The execution lock was released after reassignment; board lifecycle owns the outcome.",
   ],
   [
+    "lease_released_before_terminal",
+    "Run teardown terminalized a still-live row before releasing its lease; runtime lifecycle owns the outcome.",
+  ],
+  [
     "hot_restart_adopted_run_deadline",
     "The hot-restart reaper terminates the adopted process and queues its process-loss retry; runtime lifecycle owns recovery.",
   ],
