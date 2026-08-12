@@ -316,6 +316,13 @@ function runGeneralSuites(routeTests) {
   }
 }
 
+function buildGeneralServerExcludeArgs(routeTests) {
+  // Vitest is launched from the repository root, so exclusion globs must also
+  // be repository-root relative. `serverPath` is relative to the server
+  // project and silently fails to exclude these suites from the general lane.
+  return routeTests.flatMap((file) => ["--exclude", file.repoPath]);
+}
+
 function runProjectGroup(projects, groupName, shardIndex = null, shardCount = null) {
   // With shard args, lean on Vitest's native --shard: each matrix job runs the
   // same per-project invocations but only its slice of each project's test
@@ -357,7 +364,7 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
       return;
     }
 
-    const excludeRouteArgs = routeTests.flatMap((file) => ["--exclude", file.serverPath]);
+    const excludeRouteArgs = buildGeneralServerExcludeArgs(routeTests);
     runVitest(
       [
         "--project",
@@ -444,6 +451,7 @@ if (options.dryRun) {
         availableGeneralGroups: generalGroupNames,
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
+        generalServerExcludePatterns: routeTests.map((routeTest) => routeTest.repoPath),
         generalServerSuiteCount: generalServerTestFiles.length,
         selectedGeneralServerSuites:
           options.mode === generalModeName &&
