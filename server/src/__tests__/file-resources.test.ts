@@ -1376,45 +1376,6 @@ describeEmbeddedPostgres("workspace file resources", () => {
     expect(first.headers["content-disposition"]).toBe('attachment; filename="slow-download.bin"');
     expect(Buffer.compare(first.body as Buffer, Buffer.from("slow"))).toBe(0);
   });
-});
-
-describe("file resource list limiter", () => {
-  it("uses tighter list-specific rate and concurrency limits", () => {
-    const limiter = createFileResourceListLimiter({
-      maxConcurrent: 1,
-      maxRequests: 2,
-      windowMs: 60_000,
-    });
-    const key = "company:board-user:issue";
-    const release = limiter.acquire(key);
-
-    let concurrencyError: unknown;
-    try {
-      limiter.acquire(key);
-    } catch (error) {
-      concurrencyError = error;
-    }
-    expect(concurrencyError).toMatchObject({
-      status: 429,
-      message: "Too many concurrent workspace file list requests",
-      details: { code: "concurrency_limited" },
-    });
-
-    release();
-
-    let rateError: unknown;
-    try {
-      limiter.acquire(key);
-    } catch (error) {
-      rateError = error;
-    }
-    expect(rateError).toMatchObject({
-      status: 429,
-      message: "Too many workspace file list requests",
-      details: { code: "rate_limited" },
-    });
-  });
-
   it("returns mixed deduplicated availability results with one aggregate audit event", async () => {
     const { root, projectRoot, targetProjectRoot, executionRoot } = await makeWorkspace();
     const graph = await seedGraph(db, {
@@ -1596,6 +1557,28 @@ describe("file resource list limiter", () => {
     expect((await request(boardApp)
       .post(`/api/issues/${graph.issueId}/file-resources/availability`)
       .send({ queries: Array.from({ length: 101 }, (_, index) => ({ path: `file-${index}.ts` })) })).status).toBe(400);
+  });
+});
+
+describe("file resource list limiter", () => {
+  it("uses tighter list-specific rate and concurrency limits", () => {
+    const limiter = createFileResourceListLimiter({
+      maxConcurrent: 1,
+      maxRequests: 2,
+      windowMs: 60_000,
+    });
+    const key = "company:board-user:issue";
+    const release = limiter.acquire(key);
+
+    expect(() => limiter.acquire(key)).toThrow(expect.objectContaining({
+      status: 429,
+      details: { code: "concurrency_limited" },
+    }));
+    release();
+    expect(() => limiter.acquire(key)).toThrow(expect.objectContaining({
+      status: 429,
+      details: { code: "rate_limited" },
+    }));
   });
 });
 

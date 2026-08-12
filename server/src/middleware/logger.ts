@@ -3,6 +3,8 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import pino from "pino";
 import { pinoHttp } from "pino-http";
+import { readConfigFile } from "../config-file.js";
+import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
 import { redactSensitive } from "./redact-sensitive.js";

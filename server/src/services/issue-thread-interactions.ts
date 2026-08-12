@@ -2012,7 +2012,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
           const now = new Date();
           const supersededResult = data.kind === "ask_user_questions"
             ? buildSupersededByNewerInteractionResult(row.id)
-            : buildSupersededByNewerRequestResult(row.id);
+            : buildSupersededByNewerDecisionSurfaceResult(row, row.id);
           const supersededRows = await tx
             .update(issueThreadInteractions)
             .set({
