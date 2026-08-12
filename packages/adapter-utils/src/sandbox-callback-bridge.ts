@@ -545,10 +545,10 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       // A direct `> remotePath` redirect truncates the final path before the
       // decode writes it, so a reader can see an empty or partial file.
       const tempPath = `${remotePath}.paperclip-upload.b64`;
-      const decodedTempPath = `${remotePath}.paperclip-upload.tmp`;
+      const decodedPath = `${remotePath}.paperclip-upload.decoded`;
       await runChecked(
         `prepare upload ${remotePath}`,
-        `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} ${shellQuote(decodedTempPath)} && : > ${shellQuote(tempPath)}`,
+        `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(tempPath)}`,
       );
       const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
       for (const chunk of base64Chunks(base64Body)) {
@@ -559,7 +559,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       }
       await runChecked(
         `finalize upload ${remotePath}`,
-        `base64 -d < ${shellQuote(tempPath)} > ${shellQuote(decodedTempPath)} && mv ${shellQuote(decodedTempPath)} ${shellQuote(remotePath)} && rm -f ${shellQuote(tempPath)}`,
+        `base64 -d < ${shellQuote(tempPath)} > ${shellQuote(decodedPath)} && mv ${shellQuote(decodedPath)} ${shellQuote(remotePath)} && rm -f ${shellQuote(tempPath)}`,
       );
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
