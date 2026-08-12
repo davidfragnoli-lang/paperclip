@@ -18,6 +18,7 @@ import { useIssueDocuments } from "@/hooks/useIssueDocuments";
 import { selectAgentArtifactAttachments } from "@/lib/issue-artifacts";
 import { projectsApi } from "../../api/projects";
 import { useCompany } from "../../context/CompanyContext";
+import { useSidebar } from "../../context/SidebarContext";
 import { queryKeys } from "../../lib/queryKeys";
 import { buildCompanyUserInlineOptions, buildCompanyUserLabelMap, buildCompanyUserProfileMap, isAgentTaskTarget } from "../../lib/company-members";
 import { ISSUE_OVERRIDE_ADAPTER_TYPES, type IssueModelLane } from "../../lib/issue-assignee-overrides";
@@ -166,6 +167,7 @@ export function IssueProperties({
   checkingMonitorNow = false,
 }: IssuePropertiesProps) {
   const { selectedCompanyId } = useCompany();
+  const { isMobile } = useSidebar();
   const queryClient = useQueryClient();
   const companyId = issue.companyId ?? selectedCompanyId;
   const { data: experimentalSettings } = useQuery({
@@ -2160,7 +2162,12 @@ export function IssueProperties({
           <div>
             <PropertyRow label="Blocked by" wrap>
               {visibleBlockedByRelations.map((relation) => (
-                <RemovableIssueReferencePill key={relation.id} issue={relation} onRemove={removeBlockedBy} />
+                <RemovableIssueReferencePill
+                  key={relation.id}
+                  issue={relation}
+                  onRemove={removeBlockedBy}
+                  isMobile={isMobile}
+                />
               ))}
               <ExpandRelationListButton
                 hiddenCount={hiddenBlockedByCount}
@@ -2178,7 +2185,12 @@ export function IssueProperties({
         ) : (
           <PropertyRow label="Blocked by" wrap>
             {visibleBlockedByRelations.map((relation) => (
-              <RemovableIssueReferencePill key={relation.id} issue={relation} onRemove={removeBlockedBy} />
+              <RemovableIssueReferencePill
+                key={relation.id}
+                issue={relation}
+                onRemove={removeBlockedBy}
+                isMobile={isMobile}
+              />
             ))}
             <ExpandRelationListButton
               hiddenCount={hiddenBlockedByCount}
@@ -2219,30 +2231,35 @@ export function IssueProperties({
           )}
         </PropertyRow>
 
-        <PropertyRow label="Sub-tasks" wrap>
-          <div className="flex flex-wrap items-center gap-1.5">
-            {childIssues.length > 0
-              ? visibleChildIssues.map((child) => (
-                <IssueReferencePill key={child.id} issue={child} />
-              ))
-              : null}
-            <ExpandRelationListButton
-              hiddenCount={hiddenChildIssueCount}
-              expanded={subTasksExpanded}
-              onClick={() => setSubTasksExpanded((expanded) => !expanded)}
-            />
-            {onAddSubIssue ? (
-              <button
-                type="button"
-                className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
-                onClick={onAddSubIssue}
-              >
-                <Plus className="h-3 w-3" />
-                Add sub-task
-              </button>
-            ) : null}
-          </div>
-        </PropertyRow>
+        {/* Chat shell promotes sub-tasks to their own pane tab (the full tree),
+            so the slim pill row here would duplicate that home (PAP-496). Keep
+            the pill row only for the classic center-column layout. */}
+        {taskChatShellEnabled ? null : (
+          <PropertyRow label="Sub-tasks" wrap>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {childIssues.length > 0
+                ? visibleChildIssues.map((child) => (
+                  <IssueReferencePill key={child.id} issue={child} />
+                ))
+                : null}
+              <ExpandRelationListButton
+                hiddenCount={hiddenChildIssueCount}
+                expanded={subTasksExpanded}
+                onClick={() => setSubTasksExpanded((expanded) => !expanded)}
+              />
+              {onAddSubIssue ? (
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+                  onClick={onAddSubIssue}
+                >
+                  <Plus className="h-3 w-3" />
+                  Add sub-task
+                </button>
+              ) : null}
+            </div>
+          </PropertyRow>
+        )}
 
         {relatedTasks.length > 0 ? (
           <PropertyRow label="Related tasks" wrap>
@@ -2551,7 +2568,8 @@ export function IssueProperties({
   // Fall back to Properties if the selected tab's content went away (or the
   // selection was made on another issue).
   const activePaneTab =
-    (paneTab === "plans" && !hasPlanTab) || (paneTab === "artifacts" && !hasArtifactsTab)
+    (paneTab === "plans" && !hasPlanTab)
+    || (paneTab === "artifacts" && !hasArtifactsTab)
       ? "properties"
       : paneTab;
   // In the pane header the strip stretches to the bar's full height and the
