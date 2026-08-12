@@ -1480,17 +1480,17 @@
       "breakpoints": true
     },
     {
-      "idx": 212,
+      "idx": 213,
       "version": "7",
       "when": 1786388759523,
-      "tag": "0212_onboarding_first_task_unique",
+      "tag": "0213_onboarding_first_task_unique",
       "breakpoints": true
     },
     {
-      "idx": 213,
+      "idx": 214,
       "version": "7",
       "when": 1786467951626,
-      "tag": "0213_complete_mystique",
+      "tag": "0214_complete_mystique",
       "breakpoints": true
     }
   ]
