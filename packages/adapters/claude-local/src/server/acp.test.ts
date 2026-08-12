@@ -86,14 +86,12 @@ afterEach(async () => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  // Remote ACP runs use a detached process-session event writer. Under suite
-  // load its final event can land between rm's directory scan and rmdir,
-  // producing ENOTEMPTY after the assertions have already passed. Retry that
-  // bounded teardown window instead of turning a successful test into a flake.
+  // The sandbox process-session bridge writes event files asynchronously; on slow
+  // CI shards a final write can race the recursive rm (ENOTEMPTY on the events
+  // dir), so let fs.rm retry until the writer has quiesced.
   await Promise.all(
-    tempRoots.splice(0).map((root) =>
-      fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }),
-    ),
+    tempRoots
+      .splice(0)
   );
 });
 
