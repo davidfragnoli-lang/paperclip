@@ -646,6 +646,7 @@ describe("startServer feedback export wiring", () => {
     expect(callOrder).toEqual(["adopt", "reap"]);
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledWith({
       staleThresholdMs: 5 * 60 * 1000,
+      processLostProofRunIds: [],
     });
   });
 
@@ -725,9 +726,11 @@ describe("startServer feedback export wiring", () => {
 
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenNthCalledWith(1, {
       staleThresholdMs: 5 * 60 * 1000,
+      processLostProofRunIds: [],
     });
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenNthCalledWith(2, {
       staleThresholdMs: 5 * 60 * 1000,
+      processLostProofRunIds: [],
     });
   });
 
