@@ -2358,6 +2358,42 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(settled?.status).toBe("succeeded");
   });
 
+  it("routes an explicitly marked disposable hot-restart run into startup orphan reaping", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      const heartbeat = heartbeatService(db);
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        processLostProofRunIds: [runId],
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [],
+        lostRunIds: [runId],
+        processLostProofRunIds: [runId],
+      });
+      expect(await waitForPidExit(child.pid ?? 0, 2_000)).toBe(true);
+      expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    });
+  });
+
   it("reports adopted hot-restart runs before startup reap can mark them process_lost", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
@@ -3141,6 +3177,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(lease?.status).toBe("failed");
     expect(lease?.releasedAt).toBeTruthy();
+  });
+
+  it("preserves the disposable process-lost proof window for the operating sweep", async () => {
+    const now = new Date("2026-03-19T00:01:00.000Z");
+    const { agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: 999_999,
+      now,
+      updatedAt: now,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({
+      staleThresholdMs: 5 * 60 * 1000,
+      now,
+      processLostProofRunIds: [runId],
+    });
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const failedRun = await heartbeat.getRun(runId);
+    expect(failedRun).toMatchObject({ status: "failed", errorCode: "process_lost" });
+
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(0);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+    });
+
+    const agent = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(agent?.status).toBe("error");
+    expect(agent?.errorReason?.toLowerCase()).toContain("process");
   });
 
   it("reaps a lease-less no-log local run after the real queued-to-running transition", async () => {

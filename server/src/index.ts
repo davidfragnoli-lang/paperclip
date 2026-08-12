@@ -1216,8 +1216,10 @@ export async function startServer(): Promise<StartedServer> {
       if (!ensurePrimaryRuntimeOwnership("startup").primary) return false;
       primaryHeartbeatStartupRecoveryPending = false;
       const startupHeartbeatRecovery = (async () => {
+        let processLostProofRunIds: string[] = [];
         try {
           const hotRestartAdoption = await heartbeat.reconcileHotRestartAdoption();
+          processLostProofRunIds = hotRestartAdoption.processLostProofRunIds ?? [];
           if (
             hotRestartAdoption.mode !== "not_requested" &&
             hotRestartAdoption.mode !== "reported"
@@ -1236,6 +1238,7 @@ export async function startServer(): Promise<StartedServer> {
           try {
             const result = await heartbeat.reapOrphanedRuns({
               staleThresholdMs: startupOrphanReapStaleThresholdMs,
+              processLostProofRunIds,
             });
             logger.info(
               { reaped: result.reaped, runIds: result.runIds },
@@ -1252,6 +1255,14 @@ export async function startServer(): Promise<StartedServer> {
               );
             }
           }
+        }
+
+        if (processLostProofRunIds.length > 0) {
+          logger.warn(
+            { processLostProofRunIds },
+            "preserving disposable process-lost proof state until the operating sweep runs",
+          );
+          return;
         }
 
         const promotion = await heartbeat.promoteDueScheduledRetries();

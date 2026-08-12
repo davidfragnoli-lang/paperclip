@@ -11011,6 +11011,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const finalizedWhileDownRunIds: string[] = [];
     const lostRunIds: string[] = [];
     const skippedRunIds: string[] = [];
+    const processLostProofRunIds = (intent.processLostProofRunIds ?? []).filter((runId) =>
+      reconciliationRunIds.includes(runId)
+    );
+    const processLostProofRunIdSet = new Set(processLostProofRunIds);
 
     const classify = (
       candidate: HotRestartIntentRun,
@@ -11057,6 +11061,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (run.status !== "running") {
         classify(candidate, "finalized_while_down", `run_status_${run.status}`, patch);
+        continue;
+      }
+
+      if (processLostProofRunIdSet.has(run.id)) {
+        await terminateHeartbeatRunProcess({
+          pid: run.processPid,
+          processGroupId: run.processGroupId,
+        });
+        classify(candidate, "lost", "disposable_process_lost_proof_target", patch);
         continue;
       }
 
@@ -11200,6 +11213,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       finalizedWhileDownRunIds,
       lostRunIds,
       skippedRunIds,
+      processLostProofRunIds,
       runs: reportRuns,
     });
     await removeHotRestartIntent(undefined, intent);
@@ -11213,6 +11227,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lostRunIds,
         missingSnapshotRunIds,
         skippedRunIds,
+        processLostProofRunIds,
       },
       "hot-restart adoption report written",
     );
@@ -11223,6 +11238,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       finalizedWhileDownRunIds,
       lostRunIds,
       skippedRunIds,
+      processLostProofRunIds,
     };
   }
 
@@ -14295,13 +14311,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { state: "finalized" as const, run: finalizedRun, retryEligible: false };
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; now?: Date }) {
+  async function reapOrphanedRuns(opts?: {
+    staleThresholdMs?: number;
+    now?: Date;
+    processLostProofRunIds?: readonly string[];
+  }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = opts?.now ?? new Date();
     const orphanSilenceSweepThresholdMs = Math.max(
       ORPHANED_RUN_SILENCE_SWEEP_THRESHOLD_MS,
       staleThresholdMs,
     );
+    const processLostProofRunIds = new Set(opts?.processLostProofRunIds ?? []);
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
       .select({
@@ -14351,7 +14372,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, agent } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      const isProcessLostProofRun = processLostProofRunIds.has(run.id);
+      if (!isProcessLostProofRun && (runningProcesses.has(run.id) || activeRunExecutions.has(run.id))) continue;
 
       const hotRestartAdoption = readHotRestartAdoptionMetadata(parseObject(run.resultJson));
       const adapterType = agent.adapterType;
@@ -14363,7 +14385,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // child handle or exit callback. Poll those rows immediately so a child
       // that exits after adoption is interrupted and retried instead of sitting
       // in running until the generic process-lost threshold expires.
-      if (!hotRestartAdoption && staleThresholdMs > 0) {
+      if (!isProcessLostProofRun && !hotRestartAdoption && staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
@@ -14513,7 +14535,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         monitorNextCheckAt !== undefined &&
         (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
-      const shouldRetry = (run.processLossRetryCount ?? 0) < 1 && (
+      const shouldRetry = !isProcessLostProofRun && (run.processLossRetryCount ?? 0) < 1 && (
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake
       );
@@ -14581,7 +14603,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
       }
 
-      if (!retriedRun) {
+      if (!retriedRun && !isProcessLostProofRun) {
         await releaseIssueExecutionAndPromote(finalizedRun, {
           suppressImmediateRecovery: zeroProcessMetadata,
         });
@@ -14605,7 +14627,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
-      await startNextQueuedRunForAgent(run.agentId);
+      if (!isProcessLostProofRun) await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
     }

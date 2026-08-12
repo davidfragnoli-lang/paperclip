@@ -39,6 +39,7 @@ export type HotRestartIntent = {
   drainRunIds?: string[];
   requestedByRunId: string | null;
   preflightActiveRunIds: string[];
+  processLostProofRunIds?: string[];
   shutdownSnapshot?: {
     capturedAt: string;
     signal: "SIGINT" | "SIGTERM";
@@ -69,6 +70,7 @@ export type HotRestartReport = {
   finalizedWhileDownRunIds: string[];
   lostRunIds: string[];
   skippedRunIds: string[];
+  processLostProofRunIds?: string[];
   runs: HotRestartReportRun[];
 };
 
@@ -423,6 +425,7 @@ export function parseHotRestartIntent(value: unknown): HotRestartIntent | null {
     drainRunIds: asStringArray(value.drainRunIds),
     requestedByRunId: asString(value.requestedByRunId),
     preflightActiveRunIds: asStringArray(value.preflightActiveRunIds),
+    processLostProofRunIds: asStringArray(value.processLostProofRunIds),
   };
 
   const snapshot = isRecord(value.shutdownSnapshot) ? value.shutdownSnapshot : null;
@@ -491,6 +494,7 @@ export async function writeHotRestartIntent(input: {
   drainReason?: "requested" | "active_acp_run" | null;
   requestedByRunId?: string | null;
   preflightActiveRunIds?: string[];
+  processLostProofRunIds?: string[];
   requestedAt?: Date;
   homeDir?: string;
 }) {
@@ -515,6 +519,7 @@ export async function writeHotRestartIntent(input: {
     drainReason: input.drainReason ?? (input.drainRequired ? "requested" : null),
     requestedByRunId: input.requestedByRunId ?? null,
     preflightActiveRunIds: asStringArray(input.preflightActiveRunIds),
+    processLostProofRunIds: asStringArray(input.processLostProofRunIds),
   };
   const instancePath = resolveHotRestartIntentPath(input.homeDir);
   const legacyPath = resolveLegacyHotRestartIntentPath(input.homeDir);
