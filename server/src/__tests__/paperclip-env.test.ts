@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildPaperclipEnv } from "../adapters/utils.js";
 
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -8,6 +8,10 @@ const ORIGINAL_PAPERCLIP_LISTEN_HOST = process.env.PAPERCLIP_LISTEN_HOST;
 const ORIGINAL_PAPERCLIP_LISTEN_PORT = process.env.PAPERCLIP_LISTEN_PORT;
 const ORIGINAL_HOST = process.env.HOST;
 const ORIGINAL_PORT = process.env.PORT;
+
+beforeEach(() => {
+  delete process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
+});
 
 afterEach(() => {
   if (ORIGINAL_PAPERCLIP_RUNTIME_API_URL === undefined) delete process.env.PAPERCLIP_RUNTIME_API_URL;
