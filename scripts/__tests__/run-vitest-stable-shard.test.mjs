@@ -77,6 +77,18 @@ test("a route/authz suite never leaks into the general-server shards", () => {
   }
 });
 
+test("the unsharded general-server lane excludes serialized suites from the repository root", () => {
+  const dryRun = dryRunJson(["--mode", "general", "--group", "general-server"]);
+  assert.ok(
+    dryRun.generalServerExcludePatterns.includes("server/src/__tests__/summary-slot-routes.test.ts"),
+    "serialized route exclusions must use the same repository-root paths passed to Vitest",
+  );
+  assert.ok(
+    dryRun.generalServerExcludePatterns.every((file) => file.startsWith("server/src/")),
+    "no project-relative src/... exclusion may leak into the repository-root Vitest invocation",
+  );
+});
+
 test("shard flags are rejected for the workspaces-b group", () => {
   const result = dryRun(["--mode", "general", "--group", "general-workspaces-b", "--shard-index", "0", "--shard-count", "3"]);
   assert.notEqual(result.status, 0, "workspaces-b must not accept shard flags");

@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
@@ -345,6 +345,15 @@ function createWorkspaceOperationRecorderDouble() {
   return { recorder, operations };
 }
 
+let testIsolationPaperclipHome: string | null = null;
+
+beforeEach(async () => {
+  testIsolationPaperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-runtime-home-"));
+  process.env.PAPERCLIP_HOME = testIsolationPaperclipHome;
+  delete process.env.PAPERCLIP_CONFIG;
+  delete process.env.PAPERCLIP_INSTANCE_ID;
+});
+
 afterEach(async () => {
   await Promise.all(
     Array.from(leasedRunIds).map(async (runId) => {
@@ -358,6 +367,10 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
   await resetRuntimeServicesForTests();
+  if (testIsolationPaperclipHome) {
+    await fs.rm(testIsolationPaperclipHome, { recursive: true, force: true });
+    testIsolationPaperclipHome = null;
+  }
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
@@ -3457,6 +3470,7 @@ describe("realizeExecutionWorkspace", () => {
     const instanceId = deriveWorktreeInstanceId(workspace.cwd);
     const instanceRoot = path.join(worktreesDir, "instances", instanceId);
     await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
+    const canonicalInstanceRoot = await fs.realpath(instanceRoot);
     await fs.mkdir(path.join(workspace.cwd, ".paperclip"), { recursive: true });
     await fs.writeFile(
       path.join(workspace.cwd, ".paperclip", ".env"),
@@ -3498,7 +3512,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(operations[0]?.command).toBe("printf 'cleanup ok\\n'");
     expect(operations[1]?.metadata).toMatchObject({
       cleanupAction: "remove_worktree_instance",
-      instanceRoot,
+      instanceRoot: canonicalInstanceRoot,
     });
     expect(operations[2]?.metadata).toMatchObject({
       cleanupAction: "worktree_remove",

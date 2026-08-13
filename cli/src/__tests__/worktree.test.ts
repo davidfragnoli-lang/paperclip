@@ -178,8 +178,8 @@ describe("worktree helpers", () => {
       process.chdir(targetRoot);
 
       expect(resolveCurrentWorktreeEndpoint()).toMatchObject({
-        rootPath: targetRoot,
-        configPath: localConfig,
+        rootPath: fs.realpathSync(targetRoot),
+        configPath: fs.realpathSync(localConfig),
         isCurrent: true,
       });
     } finally {
@@ -201,8 +201,8 @@ describe("worktree helpers", () => {
       process.chdir(nestedDirectory);
 
       expect(resolveCurrentWorktreeEndpoint()).toMatchObject({
-        rootPath: targetRoot,
-        configPath: localConfig,
+        rootPath: fs.realpathSync(targetRoot),
+        configPath: fs.realpathSync(localConfig),
         isCurrent: true,
       });
     } finally {

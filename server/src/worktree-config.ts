@@ -252,6 +252,10 @@ function resolveWorktreeRuntimeContext(
   };
 }
 
+export function isIsolatedWorktreeRuntimeConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return resolveWorktreeRuntimeContext(env) !== null;
+}
+
 function atomicWriteFile(filePath: string, contents: string): void {
   let attempt = 0;
 

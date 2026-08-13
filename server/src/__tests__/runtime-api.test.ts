@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { describe, expect, it } from "vitest";
 import {
   buildRuntimeApiCandidateUrls,
@@ -5,8 +6,26 @@ import {
   collectReachableInterfaceHosts,
 } from "../runtime-api.js";
 
+async function deliveredCandidatesContainReachableJsonApi(serializedCandidates: string): Promise<boolean> {
+  const candidates = JSON.parse(serializedCandidates) as string[];
+  const results = await Promise.all(
+    candidates.map(async (candidate) => {
+      try {
+        const response = await fetch(`${candidate}/api/health`, {
+          redirect: "manual",
+          signal: AbortSignal.timeout(1_000),
+        });
+        return response.status === 200 && response.headers.get("content-type")?.includes("application/json") === true;
+      } catch {
+        return false;
+      }
+    }),
+  );
+  return results.some(Boolean);
+}
+
 describe("runtime API discovery", () => {
-  it("prefers the explicit public base URL for the primary runtime URL", () => {
+  it("keeps the primary runtime URL on the plaintext listener when a public base URL exists", () => {
     expect(
       choosePrimaryRuntimeApiUrl({
         authPublicBaseUrl: "https://paperclip.example.com/base/path",
@@ -14,7 +33,7 @@ describe("runtime API discovery", () => {
         bindHost: "0.0.0.0",
         port: 3102,
       }),
-    ).toBe("https://paperclip.example.com");
+    ).toBe("http://198.51.100.10:3102");
   });
 
   it("prefers the loopback bind host over allowed hostnames for the primary runtime URL", () => {
@@ -87,8 +106,59 @@ describe("runtime API discovery", () => {
     ).toEqual([
       "https://agent-entry.example.test",
       "https://paperclip.example.test",
-      "https://198.51.100.10:3102",
+      "http://198.51.100.10:3102",
     ]);
+  });
+
+  it("keeps loopback candidates on http when the public origin uses https", () => {
+    expect(
+      buildRuntimeApiCandidateUrls({
+        preferredApiUrl: "https://paperclip.example.test",
+        authPublicBaseUrl: "https://paperclip.example.test",
+        allowedHostnames: [],
+        bindHost: "127.0.0.1",
+        port: 3100,
+        networkInterfacesMap: {},
+      }),
+    ).toEqual([
+      "https://paperclip.example.test",
+      "http://127.0.0.1:3100",
+    ]);
+  });
+
+  it("delivers at least one candidate that reaches the plaintext JSON API", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ status: "ok" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP listener address");
+
+      const preFixArtifact = JSON.stringify([
+        `https://localhost:${address.port}`,
+        `https://127.0.0.1:${address.port}`,
+      ]);
+      expect(await deliveredCandidatesContainReachableJsonApi(preFixArtifact)).toBe(false);
+
+      const deliveredArtifact = JSON.stringify(
+        buildRuntimeApiCandidateUrls({
+          preferredApiUrl: `https://localhost:${address.port}`,
+          authPublicBaseUrl: `https://localhost:${address.port}`,
+          allowedHostnames: [],
+          bindHost: "127.0.0.1",
+          port: address.port,
+          networkInterfacesMap: {},
+        }),
+      );
+      expect(await deliveredCandidatesContainReachableJsonApi(deliveredArtifact)).toBe(true);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+    }
   });
 
   it("adds host.docker.internal when the explicit base URL is loopback", () => {

@@ -1260,6 +1260,7 @@ export interface RequestConfirmationResult {
     | "withdrawn"
     | "issue_closed"
     | "addressee_deleted";
+  targetMutationApplied?: false;
   reason?: string | null;
   commentId?: string | null;
   supersededByInteractionId?: string | null;

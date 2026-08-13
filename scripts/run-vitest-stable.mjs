@@ -267,6 +267,34 @@ function runVitest(args, label) {
     PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-${invocationIndex}`,
     TMPDIR: path.join(testRoot, "t"),
   };
+  // Heartbeat-launched verification inherits live control-plane and workspace
+  // coordinates. They are production inputs, not test fixtures, and can make
+  // suites target the live runtime or shared worktree roots. Keep only the
+  // per-invocation PAPERCLIP_HOME/INSTANCE_ID defined above.
+  for (const key of Object.keys(env)) {
+    if (
+      key.startsWith("PAPERCLIP_WORKSPACE_") ||
+      key.startsWith("PAPERCLIP_WAKE_") ||
+      [
+        "PAPERCLIP_AGENT_ID",
+        "PAPERCLIP_API_KEY",
+        "PAPERCLIP_API_URL",
+        "PAPERCLIP_COMPANY_ID",
+        "PAPERCLIP_ISSUE_WORK_MODE",
+        "PAPERCLIP_LISTEN_HOST",
+        "PAPERCLIP_LISTEN_PORT",
+        "PAPERCLIP_RUNTIME_API_URL",
+        "PAPERCLIP_RUN_ID",
+        "PAPERCLIP_RUN_SCRATCH_DIR",
+        "PAPERCLIP_SCRATCH_DIR",
+        "PAPERCLIP_TASK_ID",
+        "PAPERCLIP_TASK_SCRATCH_DIR",
+        "PAPERCLIP_TMPDIR",
+      ].includes(key)
+    ) {
+      delete env[key];
+    }
+  }
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
   const result = spawnSync("pnpm", ["exec", "vitest", "run", ...args], {
@@ -287,6 +315,13 @@ function runGeneralSuites(routeTests) {
   for (const groupName of generalGroupNames) {
     runGeneralGroup(routeTests, groupName);
   }
+}
+
+function buildGeneralServerExcludeArgs(routeTests) {
+  // Vitest is launched from the repository root, so exclusion globs must also
+  // be repository-root relative. `serverPath` is relative to the server
+  // project and silently fails to exclude these suites from the general lane.
+  return routeTests.flatMap((file) => ["--exclude", file.repoPath]);
 }
 
 function runProjectGroup(projects, groupName, shardIndex = null, shardCount = null) {
@@ -330,7 +365,7 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
       return;
     }
 
-    const excludeRouteArgs = routeTests.flatMap((file) => ["--exclude", file.serverPath]);
+    const excludeRouteArgs = buildGeneralServerExcludeArgs(routeTests);
     runVitest(
       [
         "--project",
@@ -417,6 +452,7 @@ if (options.dryRun) {
         availableGeneralGroups: generalGroupNames,
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
+        generalServerExcludePatterns: routeTests.map((routeTest) => routeTest.repoPath),
         generalServerSuiteCount: generalServerTestFiles.length,
         selectedGeneralServerSuites:
           options.mode === generalModeName &&

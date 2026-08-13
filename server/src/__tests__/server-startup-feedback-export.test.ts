@@ -1,7 +1,9 @@
+import os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { buildPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -24,16 +26,24 @@ const {
   feedbackExportServiceMock,
   feedbackServiceFactoryMock,
   fakeServer,
+  bootstrapExecutionPolicyFromEnvMock,
   heartbeatServiceFactoryMock,
   heartbeatServiceMock,
   issueThreadInteractionServiceFactoryMock,
   issueThreadInteractionServiceMock,
   loadConfigMock,
+  loggerWarnMock,
+  isIsolatedWorktreeRuntimeConfiguredMock,
+  maybePersistWorktreeRuntimePortsMock,
+  reconcilePersistedRuntimeServicesOnStartupMock,
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
   routineServiceMock,
 } = vi.hoisted(() => {
-  const createAppMock = vi.fn(async () => ((_: unknown, __: unknown) => {}) as never);
+  const createAppMock = vi.fn(async () => Object.assign(
+    (_: unknown, __: unknown) => {},
+    { locals: {} as Record<string, unknown> },
+  ) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
   const createDbMock = vi.fn(() => ({
     select: vi.fn(() => ({
@@ -57,6 +67,7 @@ const {
       dispatchRequeued: 0,
       continuationRequeued: 0,
       successfulRunHandoffEscalated: 0,
+      reviewParticipantTypedPendingSkipped: 0,
       escalated: 0,
       skipped: 0,
       issueIds: [],
@@ -112,6 +123,7 @@ const {
     flushPendingFeedbackTraces: vi.fn(async () => ({ attempted: 0, sent: 0, failed: 0 })),
   };
   const feedbackServiceFactoryMock = vi.fn(() => feedbackExportServiceMock);
+  const bootstrapExecutionPolicyFromEnvMock = vi.fn(async () => null);
   const fakeServer = {
     once: vi.fn().mockReturnThis(),
     off: vi.fn().mockReturnThis(),
@@ -122,6 +134,10 @@ const {
     close: vi.fn(),
   };
   const loadConfigMock = vi.fn();
+  const loggerWarnMock = vi.fn();
+  const isIsolatedWorktreeRuntimeConfiguredMock = vi.fn(() => false);
+  const maybePersistWorktreeRuntimePortsMock = vi.fn();
+  const reconcilePersistedRuntimeServicesOnStartupMock = vi.fn(async () => ({ reconciled: 0 }));
 
   return {
     createAppMock,
@@ -138,11 +154,16 @@ const {
     feedbackExportServiceMock,
     feedbackServiceFactoryMock,
     fakeServer,
+    bootstrapExecutionPolicyFromEnvMock,
     heartbeatServiceFactoryMock,
     heartbeatServiceMock,
     issueThreadInteractionServiceFactoryMock,
     issueThreadInteractionServiceMock,
     loadConfigMock,
+    loggerWarnMock,
+    isIsolatedWorktreeRuntimeConfiguredMock,
+    maybePersistWorktreeRuntimePortsMock,
+    reconcilePersistedRuntimeServicesOnStartupMock,
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
     routineServiceMock,
@@ -190,6 +211,48 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function setWritableStartupStatePath() {
+  process.env.PAPERCLIP_RUNTIME_STARTUP_STATE_FILE = path.join(
+    os.tmpdir(),
+    "paperclip-runtime-startup-state.test.json",
+  );
+}
+
+function setWritablePrimaryLeasePath() {
+  process.env.PAPERCLIP_RUNTIME_PRIMARY_LEASE_FILE = path.join(
+    os.tmpdir(),
+    "paperclip-runtime-primary-lease.test.json",
+  );
+}
+
+function createLocalTrustedDbStub() {
+  const buildSelect = (rows: unknown[]) => ({
+    from() {
+      return {
+        where() {
+          return Promise.resolve(rows);
+        },
+        then(resolve: (value: unknown[]) => unknown) {
+          return Promise.resolve(rows).then(resolve);
+        },
+      };
+    },
+  });
+
+  return {
+    select() {
+      return buildSelect([]);
+    },
+    insert() {
+      return {
+        values() {
+          return Promise.resolve();
+        },
+      };
+    },
+  };
+}
+
 vi.mock("node:http", () => ({
   createServer: vi.fn(() => fakeServer),
 }));
@@ -221,13 +284,18 @@ vi.mock("../config.js", () => ({
   loadConfig: loadConfigMock,
 }));
 
+vi.mock("../worktree-config.js", () => ({
+  isIsolatedWorktreeRuntimeConfigured: isIsolatedWorktreeRuntimeConfiguredMock,
+  maybePersistWorktreeRuntimePorts: maybePersistWorktreeRuntimePortsMock,
+}));
+
 vi.mock("../middleware/logger.js", () => ({
   logger: {
     child: vi.fn(function child() {
       return this;
     }),
     info: vi.fn(),
-    warn: vi.fn(),
+    warn: loggerWarnMock,
     error: vi.fn(),
   },
 }));
@@ -261,7 +329,7 @@ vi.mock("../services/index.js", () => ({
     deliverNotifications: vi.fn(async () => ({ notifiedAgents: 0, delivered: 0 })),
   })),
   feedbackService: feedbackServiceFactoryMock,
-  bootstrapExecutionPolicyFromEnv: vi.fn(async () => null),
+  bootstrapExecutionPolicyFromEnv: bootstrapExecutionPolicyFromEnvMock,
   applyManagedEnvironments: vi.fn(async () => null),
   environmentCustomImageService: environmentCustomImagesServiceFactoryMock,
   executionWorkspaceService: executionWorkspaceServiceFactoryMock,
@@ -298,7 +366,7 @@ vi.mock("../services/index.js", () => ({
     unknown: 0,
     duplicates: 0,
   })),
-  reconcilePersistedRuntimeServicesOnStartup: vi.fn(async () => ({ reconciled: 0 })),
+  reconcilePersistedRuntimeServicesOnStartup: reconcilePersistedRuntimeServicesOnStartupMock,
   resolveHeartbeatSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
   routineService: routineServiceFactoryMock,
   statusCardService: vi.fn(() => ({})),
@@ -354,14 +422,20 @@ describe("startServer feedback export wiring", () => {
     vi.clearAllMocks();
     process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
     process.env.PAPERCLIP_AGENT_JWT_SECRET = "0123456789abcdef0123456789abcdef";
+    detectPortMock.mockReset();
+    detectPortMock.mockImplementation(async (port: number) => port);
     loadConfigMock.mockReturnValue(buildTestConfig());
     resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
       suppressed: false,
       reason: null,
     });
+    isIsolatedWorktreeRuntimeConfiguredMock.mockReturnValue(false);
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
     process.env.BETTER_AUTH_SECRET = "test-secret";
+    setWritableStartupStatePath();
+    setWritablePrimaryLeasePath();
+    rmSync(process.env.PAPERCLIP_RUNTIME_PRIMARY_LEASE_FILE!, { force: true });
   });
 
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
@@ -552,6 +626,194 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
   });
 
+  it("reconciles hot-restart adoption before startup orphan reaping", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    const callOrder: string[] = [];
+    heartbeatServiceMock.reconcileHotRestartAdoption.mockImplementationOnce(async () => {
+      callOrder.push("adopt");
+      return { mode: "reported" as const, adoptedRunIds: [], finalizedWhileDownRunIds: [], lostRunIds: [], skippedRunIds: [] };
+    });
+    heartbeatServiceMock.reapOrphanedRuns.mockImplementationOnce(async () => {
+      callOrder.push("reap");
+      return { reaped: 0, runIds: [] };
+    });
+
+    await startServer();
+
+    expect(callOrder).toEqual(["adopt", "reap"]);
+    expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledWith({
+      staleThresholdMs: 5 * 60 * 1000,
+      processLostProofRunIds: [],
+    });
+  });
+
+  it("warns when typed review suppression is the only startup reconciliation change", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.reconcileStrandedAssignedIssues.mockResolvedValueOnce({
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      reviewParticipantTypedPendingSkipped: 1,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    });
+
+    await startServer();
+
+    expect(loggerWarnMock).toHaveBeenCalledWith(
+      expect.objectContaining({ reviewParticipantTypedPendingSkipped: 1 }),
+      "startup heartbeat recovery changed assigned issue state",
+    );
+  });
+
+  it("warns when typed review suppression is the only periodic reconciliation change", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockResolvedValueOnce({
+        assignmentDispatched: 0,
+        dispatchRequeued: 0,
+        continuationRequeued: 0,
+        successfulRunHandoffEscalated: 0,
+        reviewParticipantTypedPendingSkipped: 1,
+        escalated: 0,
+        skipped: 0,
+        issueIds: [],
+      });
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await vi.waitFor(() => {
+        expect(loggerWarnMock).toHaveBeenCalledWith(
+          expect.objectContaining({ reviewParticipantTypedPendingSkipped: 1 }),
+          "periodic heartbeat recovery changed assigned issue state",
+        );
+      });
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("preserves the startup orphan-reap guard across retries", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.reapOrphanedRuns
+      .mockRejectedValueOnce(new Error("transient reap failure"))
+      .mockResolvedValueOnce({ reaped: 0, runIds: [] });
+
+    await startServer();
+
+    expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenNthCalledWith(1, {
+      staleThresholdMs: 5 * 60 * 1000,
+      processLostProofRunIds: [],
+    });
+    expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenNthCalledWith(2, {
+      staleThresholdMs: 5 * 60 * 1000,
+      processLostProofRunIds: [],
+    });
+  });
+
+  it("refuses a fallback-port boot before app schedulers can start", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      deploymentMode: "local_trusted",
+      port: 3100,
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+      databaseBackupEnabled: true,
+    }));
+    createDbMock.mockReturnValueOnce(createLocalTrustedDbStub() as never);
+    detectPortMock.mockResolvedValueOnce(3101);
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: false,
+      reason: null,
+    });
+    await expect(startServer()).rejects.toThrow(
+      "requested listen port 3100 is already in use; refusing fallback to 3101",
+    );
+
+    expect(createAppMock).not.toHaveBeenCalled();
+    expect(bootstrapExecutionPolicyFromEnvMock).not.toHaveBeenCalled();
+    expect(reconcilePersistedRuntimeServicesOnStartupMock).not.toHaveBeenCalled();
+    expect(heartbeatServiceFactoryMock).not.toHaveBeenCalled();
+    expect(routineServiceFactoryMock).not.toHaveBeenCalled();
+  });
+
+  it("allows an explicitly isolated worktree to own its selected fallback port", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      port: 3100,
+      heartbeatSchedulerEnabled: false,
+    }));
+    detectPortMock.mockResolvedValueOnce(3101);
+    isIsolatedWorktreeRuntimeConfiguredMock.mockReturnValue(true);
+
+    const started = await startServer();
+
+    expect(started.listenPort).toBe(3101);
+    expect(process.env.PAPERCLIP_PRIMARY_RUNTIME_INSTANCE).toBe("true");
+    expect(createAppMock).toHaveBeenCalledTimes(1);
+    expect(maybePersistWorktreeRuntimePortsMock).toHaveBeenCalledWith({
+      serverPort: 3101,
+      databasePort: null,
+    });
+    expect(bootstrapExecutionPolicyFromEnvMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for the listen bind to succeed before startup orphan reaping", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      port: 3100,
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    writeFileSync(
+      process.env.PAPERCLIP_RUNTIME_PRIMARY_LEASE_FILE!,
+      JSON.stringify({
+        pid: 999999,
+        startedAt: "2026-07-29T08:47:46.000Z",
+        requestedPort: 3100,
+      }),
+      "utf8",
+    );
+
+    let listenCallback: (() => void) | null = null;
+    fakeServer.listen.mockImplementationOnce((_port: number, _host: string, callback?: () => void) => {
+      listenCallback = callback ?? null;
+      return fakeServer;
+    });
+
+    const startPromise = startServer();
+    await vi.waitFor(() => expect(listenCallback).not.toBeNull());
+
+    expect(heartbeatServiceMock.reconcileHotRestartAdoption).not.toHaveBeenCalled();
+    expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
+
+    listenCallback?.();
+    await startPromise;
+
+    expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses authenticated public startup without an external database URL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",
@@ -580,11 +842,27 @@ describe("startServer feedback export wiring", () => {
     );
     expect(createDbMock).not.toHaveBeenCalled();
   });
+
+  it("refuses authenticated public startup when the requested listen port is busy", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      deploymentExposure: "public",
+      port: 3100,
+      authBaseUrlMode: "explicit",
+      authPublicBaseUrl: "https://tenant.example.com",
+      heartbeatSchedulerEnabled: true,
+    }));
+    detectPortMock.mockResolvedValueOnce(3110);
+
+    await expect(startServer()).rejects.toThrow(
+      "authenticated public deployments require requested listen port 3100 to be available; refusing fallback to 3110",
+    );
+  });
 });
 
 describe("startServer authenticated auth origin setup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    isIsolatedWorktreeRuntimeConfiguredMock.mockReturnValue(false);
     process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
     loadConfigMock.mockReturnValue(buildTestConfig());
     createBetterAuthInstanceMock.mockReturnValue({});
@@ -593,6 +871,7 @@ describe("startServer authenticated auth origin setup", () => {
   });
 
   it("derives trusted origins from the detected listen port before auth initializes", async () => {
+    isIsolatedWorktreeRuntimeConfiguredMock.mockReturnValue(true);
     loadConfigMock.mockReturnValue(buildTestConfig({
       port: 3210,
       allowedHostnames: ["board.example.test"],
@@ -632,6 +911,7 @@ describe("startServer authenticated auth origin setup", () => {
 describe("startServer PAPERCLIP_API_URL handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    isIsolatedWorktreeRuntimeConfiguredMock.mockReturnValue(false);
     process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
     loadConfigMock.mockReturnValue(buildTestConfig());
     process.env.BETTER_AUTH_SECRET = "test-secret";
@@ -658,17 +938,20 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     else process.env.PAPERCLIP_LISTEN_PORT = ORIGINAL_PAPERCLIP_LISTEN_PORT;
   });
 
-  it("uses the externally set PAPERCLIP_API_URL when provided", async () => {
-    process.env.PAPERCLIP_API_URL = "http://custom-api:3100";
+  it("keeps an external public URL separate from the agent-delivered runtime URL", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.example.test";
 
     const started = await startServer();
+    const agentEnv = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
 
-    expect(started.apiUrl).toBe("http://custom-api:3100");
-    expect(process.env.PAPERCLIP_API_URL).toBe("http://custom-api:3100");
+    expect(started.apiUrl).toBe("https://paperclip.example.test");
+    expect(process.env.PAPERCLIP_API_URL).toBe("https://paperclip.example.test");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3210");
+    expect(agentEnv.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3210");
     expect(JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]")).toEqual(
-      expect.arrayContaining(["http://custom-api:3100"]),
+      expect.arrayContaining(["https://paperclip.example.test", "http://127.0.0.1:3210"]),
     );
-    expect(JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]")[0]).toBe("http://custom-api:3100");
+    expect(JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]")[0]).toBe("https://paperclip.example.test");
   });
 
   it("falls back to host-based URL when PAPERCLIP_API_URL is not set", async () => {
@@ -694,6 +977,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
   });
 
   it("rewrites explicit-port auth public URLs when detect-port selects a new port", async () => {
+    isIsolatedWorktreeRuntimeConfiguredMock.mockReturnValue(true);
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
       authBaseUrlMode: "explicit",
@@ -705,10 +989,11 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("http://my-host.ts.net:3110");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3110");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3110");
   });
 
   it("keeps no-port auth public URLs stable when detect-port selects a new port", async () => {
+    isIsolatedWorktreeRuntimeConfiguredMock.mockReturnValue(true);
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
       authBaseUrlMode: "explicit",
@@ -720,6 +1005,9 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("https://paperclip.example");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("https://paperclip.example");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3110");
+    expect(JSON.parse(process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON ?? "[]")).toEqual(
+      expect.arrayContaining(["https://paperclip.example", "http://127.0.0.1:3110"]),
+    );
   });
 });

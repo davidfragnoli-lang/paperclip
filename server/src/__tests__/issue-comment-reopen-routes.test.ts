@@ -2597,6 +2597,14 @@ describe.sequential("issue comment reopen routes", () => {
       status: "done",
       completedAt: new Date(),
       updatedAt: new Date(),
+      autoPrunedTerminalBlockerEffect: {
+        wakeTargets: [{
+          id: "dependent-1",
+          assigneeAgentId: dependentAgentId,
+          blockerIssueIds: [issue.id],
+          resolvedBlockerIssueId: issue.id,
+        }],
+      },
       _tx: tx,
     }));
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
@@ -2620,7 +2628,6 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockIssueService.listWakeableBlockedDependents).toHaveBeenCalledWith(issue.id);
     await waitForWakeup(() => {
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         dependentAgentId,
