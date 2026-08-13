@@ -18577,32 +18577,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: now,
         ...patch,
       } satisfies typeof agentWakeupRequests.$inferInsert;
-      if (skipReason === "agent.not_invokable" && opts.requestedByActorType !== "user") {
-        const suppressionCutoff = new Date(now.getTime() - 5 * 60 * 1000);
-        await db.transaction(async (tx) => {
-          await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`agent.not_invokable:${agent.companyId}:${agentId}`}))`);
-          const recentRefusal = await tx
-            .select({ id: agentWakeupRequests.id })
-            .from(agentWakeupRequests)
-            .where(
-              and(
-                eq(agentWakeupRequests.companyId, agent.companyId),
-                eq(agentWakeupRequests.agentId, agentId),
-                eq(agentWakeupRequests.status, "skipped"),
-                eq(agentWakeupRequests.reason, "agent.not_invokable"),
-                gte(agentWakeupRequests.requestedAt, suppressionCutoff),
-              ),
-            )
-            .orderBy(desc(agentWakeupRequests.requestedAt))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (!recentRefusal) {
-            await tx.insert(agentWakeupRequests).values(values);
-          }
-        });
-        return;
-      }
       await db.insert(agentWakeupRequests).values(values);
+    };
+    const recordOrCoalesceAutomatedNonInvokableRequest = async (error: string) => {
+      const now = new Date();
+      const suppressionCutoff = new Date(now.getTime() - 5 * 60 * 1000);
+      return db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`agent.not_invokable:${agent.companyId}:${agentId}`}))`);
+        const recentRefusal = await tx
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "skipped"),
+              eq(agentWakeupRequests.reason, "agent.not_invokable"),
+              gte(agentWakeupRequests.requestedAt, suppressionCutoff),
+            ),
+          )
+          .orderBy(desc(agentWakeupRequests.requestedAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (recentRefusal) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, recentRefusal.id));
+          return "coalesced" as const;
+        }
+        await tx.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason: "agent.not_invokable",
+          payload,
+          status: "skipped",
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          finishedAt: now,
+          error,
+        });
+        return "recorded" as const;
+      });
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
       await writeSkippedRequest(skipReason, {
@@ -18640,6 +18662,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         error: `Wake suppressed because company status is ${companyStatus}`,
       });
       return null;
+    }
+
+    let recordedDirectNonInvokableRefusal = false;
+    if (opts.requestedByActorType !== "user" && DIRECT_NON_INVOKABLE_STATUSES.has(agent.status)) {
+      const refusal = await recordOrCoalesceAutomatedNonInvokableRequest(
+        "Agent is not invokable in its current state",
+      );
+      if (refusal === "coalesced") return null;
+      recordedDirectNonInvokableRefusal = true;
     }
 
     const explicitResumeSession = await resolveExplicitResumeSessionOverride(agent, payload, taskKey);
@@ -18767,10 +18798,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
-      if (opts.requestedByActorType !== "user") {
-        await writeSkippedRequest("agent.not_invokable", {
-          error: invokability.message,
-        });
+      if (opts.requestedByActorType !== "user" && !recordedDirectNonInvokableRefusal) {
+        const refusal = await recordOrCoalesceAutomatedNonInvokableRequest(invokability.message);
+        if (refusal === "coalesced") return null;
       }
       throw conflict(invokability.message, {
         status: agent.status,
