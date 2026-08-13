@@ -442,22 +442,24 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     });
   });
 
-  it("bounds automated non-invokable refusal rows while user wakes still fail loudly", async () => {
+  it("bounds automated non-invokable dispatch while preserving attempted volume and loud user failure", async () => {
     const { agentId } = await seedFixture({
       agentStatus: "paused",
       agentPausedAt: new Date("2026-04-11T12:00:00.000Z"),
     });
     const heartbeat = heartbeatService(db);
 
-    await Promise.all(Array.from({ length: 30 }, async () => {
-      await expect(heartbeat.wakeup(agentId, {
+    const results = await Promise.allSettled(Array.from({ length: 30 }, async () => {
+      return heartbeat.wakeup(agentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "bounded-refusal-test",
         requestedByActorType: "system",
         requestedByActorId: "test-scheduler",
-      })).rejects.toMatchObject({ status: 409 });
+      });
     }));
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "fulfilled" && result.value === null)).toHaveLength(29);
 
     const automatedRefusals = await db
       .select()
@@ -467,7 +469,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(automatedRefusals[0]).toMatchObject({
       status: "skipped",
       reason: "agent.not_invokable",
+      coalescedCount: 29,
     });
+    expect(automatedRefusals.reduce((total, row) => total + 1 + row.coalescedCount, 0)).toBe(30);
 
     await expect(heartbeat.wakeup(agentId, {
       source: "on_demand",
