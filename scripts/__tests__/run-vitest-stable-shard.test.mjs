@@ -77,15 +77,12 @@ test("a route/authz suite never leaks into the general-server shards", () => {
   }
 });
 
-test("the unsharded general-server lane excludes serialized suites from the repository root", () => {
+test("the unsharded general-server lane uses bounded explicit allowlist shards", () => {
   const dryRun = dryRunJson(["--mode", "general", "--group", "general-server"]);
-  assert.ok(
-    dryRun.generalServerExcludePatterns.includes("server/src/__tests__/summary-slot-routes.test.ts"),
-    "serialized route exclusions must use the same repository-root paths passed to Vitest",
-  );
-  assert.ok(
-    dryRun.generalServerExcludePatterns.every((file) => file.startsWith("server/src/")),
-    "no project-relative src/... exclusion may leak into the repository-root Vitest invocation",
+  assert.equal(
+    dryRun.localGeneralServerShardCount,
+    SHARD_COUNT,
+    "the full local lane must run the explicit general-server allowlist in bounded shards",
   );
 });
 

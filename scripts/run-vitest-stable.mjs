@@ -63,6 +63,7 @@ const allModeName = "all";
 const generalServerGroupName = "general-server";
 const generalWorkspacesAGroupName = "general-workspaces-a";
 const generalWorkspacesBGroupName = "general-workspaces-b";
+const localGeneralServerShardCount = 5;
 const generalWorkspacesAProjects = ["@paperclipai/ui", "paperclipai"];
 const generalWorkspacesBProjects = nonServerProjects.filter((project) => !generalWorkspacesAProjects.includes(project));
 const generalGroupNames = [generalServerGroupName, generalWorkspacesAGroupName, generalWorkspacesBGroupName];
@@ -317,13 +318,6 @@ function runGeneralSuites(routeTests) {
   }
 }
 
-function buildGeneralServerExcludeArgs(routeTests) {
-  // Vitest is launched from the repository root, so exclusion globs must also
-  // be repository-root relative. `serverPath` is relative to the server
-  // project and silently fails to exclude these suites from the general lane.
-  return routeTests.flatMap((file) => ["--exclude", file.repoPath]);
-}
-
 function runProjectGroup(projects, groupName, shardIndex = null, shardCount = null) {
   // With shard args, lean on Vitest's native --shard: each matrix job runs the
   // same per-project invocations but only its slice of each project's test
@@ -339,6 +333,24 @@ function runProjectGroup(projects, groupName, shardIndex = null, shardCount = nu
 
 function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = null) {
   if (groupName === generalServerGroupName) {
+    if (shardCount === null) {
+      // The default local/full-suite path must use the same explicit allowlist
+      // as CI shards. A single broad project invocation relies on a long list
+      // of CLI --exclude flags; route suites have leaked through that boundary
+      // and failed late after thousands of unrelated tests had accumulated
+      // process state. Sequential shards keep local resource use bounded while
+      // preserving complete, non-overlapping coverage.
+      for (let localShardIndex = 0; localShardIndex < localGeneralServerShardCount; localShardIndex += 1) {
+        runGeneralGroup(
+          routeTests,
+          groupName,
+          localShardIndex,
+          localGeneralServerShardCount,
+        );
+      }
+      return;
+    }
+
     if (shardCount !== null && shardCount > 1) {
       const shardFiles = selectGeneralServerShard(
         generalServerTestFiles,
@@ -365,15 +377,20 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
       return;
     }
 
-    const excludeRouteArgs = buildGeneralServerExcludeArgs(routeTests);
+    const shardFiles = selectGeneralServerShard(
+      generalServerTestFiles,
+      shardIndex ?? 0,
+      1,
+      generalServerShardDurations,
+    );
     runVitest(
       [
         "--project",
         "@paperclipai/server",
         ...serializedServerVitestArgs,
-        ...excludeRouteArgs,
+        ...shardFiles,
       ],
-      `${groupName} server suites excluding ${routeTests.length} serialized suites`,
+      `${groupName} explicit server suite allowlist`,
     );
     return;
   }
@@ -453,6 +470,7 @@ if (options.dryRun) {
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
         generalServerExcludePatterns: routeTests.map((routeTest) => routeTest.repoPath),
+        localGeneralServerShardCount,
         generalServerSuiteCount: generalServerTestFiles.length,
         selectedGeneralServerSuites:
           options.mode === generalModeName &&
