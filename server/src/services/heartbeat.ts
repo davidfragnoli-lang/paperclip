@@ -297,6 +297,7 @@ import {
   evaluateAgentInvokabilityFromDb,
   shouldCancelRunsForNonInvokableAgent,
   DIRECT_NON_INVOKABLE_STATUSES,
+  AGENT_NOT_INVOKABLE_FAILURE_REASON,
   type AgentOrgRow,
 } from "./agent-invokability.js";
 import {
@@ -18667,7 +18668,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let recordedDirectNonInvokableRefusal = false;
     if (opts.requestedByActorType !== "user" && DIRECT_NON_INVOKABLE_STATUSES.has(agent.status)) {
       const refusal = await recordOrCoalesceAutomatedNonInvokableRequest(
-        "Agent is not invokable in its current state",
+        AGENT_NOT_INVOKABLE_FAILURE_REASON,
       );
       if (refusal === "coalesced") return null;
       recordedDirectNonInvokableRefusal = true;

@@ -63,6 +63,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { AGENT_NOT_INVOKABLE_FAILURE_REASON } from "./agent-invokability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
@@ -2066,7 +2067,7 @@ export function routineService(
             eq(routines.assigneeAgentId, input.agentId),
             eq(routines.status, "active"),
             eq(routineRuns.status, "failed"),
-            eq(routineRuns.failureReason, "Agent is not invokable in its current state"),
+            eq(routineRuns.failureReason, AGENT_NOT_INVOKABLE_FAILURE_REASON),
             gte(routineRuns.triggeredAt, input.pausedAt),
             lte(routineRuns.triggeredAt, input.resumedAt),
           ),

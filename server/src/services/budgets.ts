@@ -24,6 +24,7 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import { recoverPauseRefusedRoutineRuns } from "./pause-dispatch-recovery.js";
 
 type ScopeRecord = {
   companyId: string;
@@ -43,6 +44,7 @@ export type BudgetEnforcementScope = {
 
 export type BudgetServiceHooks = {
   cancelWorkForScope?: (scope: BudgetEnforcementScope) => Promise<void>;
+  recoverPauseDispatches?: typeof recoverPauseRefusedRoutineRuns;
 };
 
 function currentUtcMonthWindow(now = new Date()) {
@@ -261,6 +263,11 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
   async function resumeScopeFromBudget(policy: PolicyRow) {
     const now = new Date();
     if (policy.scopeType === "agent") {
+      const pausedAgent = await db
+        .select({ id: agents.id, pausedAt: agents.pausedAt })
+        .from(agents)
+        .where(and(eq(agents.id, policy.scopeId), eq(agents.pauseReason, "budget")))
+        .then((rows) => rows[0] ?? null);
       await db
         .update(agents)
         .set({
@@ -270,6 +277,13 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           updatedAt: now,
         })
         .where(and(eq(agents.id, policy.scopeId), eq(agents.pauseReason, "budget")));
+      if (pausedAgent?.pausedAt) {
+        await (hooks.recoverPauseDispatches ?? recoverPauseRefusedRoutineRuns)(db, {
+          agentId: pausedAgent.id,
+          pausedAt: pausedAgent.pausedAt,
+          resumedAt: now,
+        });
+      }
       return;
     }
 

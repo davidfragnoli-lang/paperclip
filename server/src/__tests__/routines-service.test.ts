@@ -36,6 +36,11 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import * as providerRegistry from "../secrets/provider-registry.ts";
 import { routineService } from "../services/routines.ts";
 import { secretService } from "../services/secrets.ts";
+import { agentService } from "../services/agents.ts";
+import {
+  AGENT_NOT_INVOKABLE_FAILURE_REASON,
+  evaluateAgentInvokability,
+} from "../services/agent-invokability.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -270,7 +275,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         status: "failed",
         triggeredAt: new Date("2026-08-10T11:00:00.000Z"),
         completedAt: new Date("2026-08-10T11:00:00.000Z"),
-        failureReason: "Agent is not invokable in its current state",
+        failureReason: AGENT_NOT_INVOKABLE_FAILURE_REASON,
         triggerPayload: { occurrence: "older" },
       },
       {
@@ -280,7 +285,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         status: "failed",
         triggeredAt: new Date("2026-08-10T12:00:00.000Z"),
         completedAt: new Date("2026-08-10T12:00:00.000Z"),
-        failureReason: "Agent is not invokable in its current state",
+        failureReason: AGENT_NOT_INVOKABLE_FAILURE_REASON,
         triggerPayload: { occurrence: "newest" },
       },
       {
@@ -290,7 +295,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         status: "failed",
         triggeredAt: new Date("2026-08-10T12:30:00.000Z"),
         completedAt: new Date("2026-08-10T12:30:00.000Z"),
-        failureReason: "Agent is not invokable in its current state",
+        failureReason: AGENT_NOT_INVOKABLE_FAILURE_REASON,
         triggerPayload: { occurrence: "second" },
       },
     ]);
@@ -307,6 +312,51 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(catchUpRuns.find((run) => run.routineId === routine.id)?.triggerPayload).toMatchObject({
       occurrence: "newest",
     });
+  });
+
+  it("recovers pause-refused runs from the shared agent resume transition", async () => {
+    const { companyId, agentId, routine, svc } = await seedFixture();
+    const pausedAt = new Date("2026-08-10T10:00:00.000Z");
+    const resumedAt = new Date("2026-08-10T13:00:00.000Z");
+    const pausedAgent = {
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      reportsTo: null,
+      status: "paused" as const,
+    };
+    const refusal = evaluateAgentInvokability(pausedAgent, [pausedAgent]);
+    expect(refusal).toMatchObject({
+      invokable: false,
+      message: AGENT_NOT_INVOKABLE_FAILURE_REASON,
+    });
+    if (refusal.invokable) throw new Error("Expected paused agent to be non-invokable");
+
+    await db
+      .update(agents)
+      .set({ status: "paused", pauseReason: "manual", pausedAt })
+      .where(eq(agents.id, agentId));
+    await db.insert(routineRuns).values({
+      companyId,
+      routineId: routine.id,
+      source: "schedule",
+      status: "failed",
+      triggeredAt: new Date("2026-08-10T12:00:00.000Z"),
+      completedAt: new Date("2026-08-10T12:00:00.000Z"),
+      failureReason: refusal.message,
+      triggerPayload: { occurrence: "shared-resume" },
+    });
+
+    await agentService(db, {
+      recoverPauseDispatches: (input) => svc.catchUpPauseRefusedRuns(input),
+    }).resume(agentId, { now: resumedAt });
+
+    const catchUpRuns = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.routineId, routine.id));
+    expect(catchUpRuns.filter((run) => run.idempotencyKey?.startsWith("agent-resume-catch-up:")))
+      .toHaveLength(1);
   });
 
   it("filters listed routines by project", async () => {

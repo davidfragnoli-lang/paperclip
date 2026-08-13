@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   activityLog,
@@ -361,13 +361,23 @@ describeEmbeddedPostgres("companyService", () => {
       },
     ]);
 
-    const reactivated = await companyService(db).update(
+    const recoverPauseDispatches = vi.fn().mockResolvedValue([]);
+    const reactivated = await companyService(db, { recoverPauseDispatches }).update(
       companyId,
       { status: "active" },
       { actorType: "user", actorId: "test-user", agentId: null, runId: null },
     );
 
     expect(reactivated?.status).toBe("active");
+    expect(recoverPauseDispatches).toHaveBeenCalledTimes(1);
+    expect(recoverPauseDispatches).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({
+        agentId: archivedPausedAgentId,
+        pausedAt: new Date("2026-06-01T00:00:00Z"),
+        resumedAt: expect.any(Date),
+      }),
+    );
 
     const reactivateActivity = await db
       .select({

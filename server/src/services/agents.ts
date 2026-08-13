@@ -39,6 +39,10 @@ import {
   buildIssueMonitorPauseShiftPatch,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
+import {
+  recoverPauseRefusedRoutineRuns,
+  type PauseDispatchRecoveryInput,
+} from "./pause-dispatch-recovery.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -282,7 +286,12 @@ export function deduplicateAgentName(
   return `${candidateName} ${Date.now()}`;
 }
 
-export function agentService(db: Db) {
+export function agentService(
+  db: Db,
+  deps: {
+    recoverPauseDispatches?: (input: PauseDispatchRecoveryInput) => Promise<unknown[]>;
+  } = {},
+) {
   const secretsSvc = secretService(db);
 
   function currentUtcMonthWindow(now = new Date()) {
@@ -715,6 +724,15 @@ export function agentService(db: Db) {
 
         return resumed;
       });
+      if (updated && existing.pausedAt) {
+        const recover = deps.recoverPauseDispatches ?? ((input: PauseDispatchRecoveryInput) =>
+          recoverPauseRefusedRoutineRuns(db, input));
+        await recover({
+          agentId: id,
+          pausedAt: existing.pausedAt,
+          resumedAt,
+        });
+      }
       return updated ? getById(updated.id) : null;
     },
 
