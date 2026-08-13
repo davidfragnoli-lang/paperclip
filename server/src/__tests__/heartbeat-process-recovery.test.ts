@@ -2365,6 +2365,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
       processPid: child.pid ?? null,
       processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "acp",
+        processTopology: "server_stdio",
+      },
     });
 
     await withTempPaperclipHome(async () => {
@@ -2375,10 +2379,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         processLostProofRunIds: [runId],
         requestedAt: new Date("2026-03-19T00:05:00.000Z"),
       });
-      await heartbeat.prepareHotRestartShutdown(
+      const preparation = await heartbeat.prepareHotRestartShutdown(
         "SIGTERM",
         new Date("2026-03-19T00:06:00.000Z"),
       );
+      expect(preparation).toMatchObject({
+        mode: "hot_restart",
+        skipDrain: true,
+        activeRunIds: [runId],
+      });
 
       const adoption = await heartbeat.reconcileHotRestartAdoption(
         new Date("2026-03-19T00:07:00.000Z"),

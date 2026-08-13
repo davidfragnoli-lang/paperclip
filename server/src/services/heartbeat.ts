@@ -10877,7 +10877,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
     };
 
-    const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
+    const processLostProofRunIdSet = new Set(intent.processLostProofRunIds ?? []);
+    const serverStdioRuns = activeRuns.filter((candidate) =>
+      isServerStdioBoundHotRestartRun(candidate)
+      && !processLostProofRunIdSet.has(candidate.run.id)
+    );
     if (serverStdioRuns.length > 0) {
       const activeServerStdioRunIds = serverStdioRuns.map(({ run }) => run.id);
       await writeHotRestartShutdownSnapshot({
