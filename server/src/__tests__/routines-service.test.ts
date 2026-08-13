@@ -314,10 +314,16 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
   });
 
-  it("recovers pause-refused runs from the shared agent resume transition", async () => {
+  it("recovers pause-refused runs through the agent resume default arm", async () => {
     const { companyId, agentId, routine, svc } = await seedFixture();
     const pausedAt = new Date("2026-08-10T10:00:00.000Z");
     const resumedAt = new Date("2026-08-10T13:00:00.000Z");
+    const triggerPayload = { occurrence: "shared-resume" };
+    const activeRun = await svc.runRoutine(routine.id, {
+      source: "api",
+      payload: triggerPayload,
+    });
+    expect(activeRun.status).toBe("issue_created");
     const pausedAgent = {
       id: agentId,
       companyId,
@@ -344,12 +350,10 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       triggeredAt: new Date("2026-08-10T12:00:00.000Z"),
       completedAt: new Date("2026-08-10T12:00:00.000Z"),
       failureReason: refusal.message,
-      triggerPayload: { occurrence: "shared-resume" },
+      triggerPayload,
     });
 
-    await agentService(db, {
-      recoverPauseDispatches: (input) => svc.catchUpPauseRefusedRuns(input),
-    }).resume(agentId, { now: resumedAt });
+    await agentService(db).resume(agentId, { now: resumedAt });
 
     const catchUpRuns = await db
       .select()
