@@ -976,7 +976,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     );
   });
 
-  it("rewrites explicit-port auth public URLs when detect-port selects a new port", async () => {
+  it("preserves explicit-port external auth public URLs when detect-port selects a new port", async () => {
     isIsolatedWorktreeRuntimeConfiguredMock.mockReturnValue(true);
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
@@ -987,8 +987,11 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     const started = await startServer();
 
+    // The server listens internally on 3110, but an explicit *external* base URL must keep
+    // its advertised port. Rewriting it to the internal listen port produced an unreachable
+    // URL that leaked to spawned agents as a dead PAPERCLIP_API_URL. (BRO-1558)
     expect(started.listenPort).toBe(3110);
-    expect(started.apiUrl).toBe("http://my-host.ts.net:3110");
+    expect(started.apiUrl).toBe("http://my-host.ts.net:3100");
     expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3110");
   });
 
