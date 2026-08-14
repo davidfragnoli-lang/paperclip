@@ -2086,6 +2086,20 @@ export function selectCheckoutBoundExecutionWorkspacePolicy(input: {
   return null;
 }
 
+export function applyCheckoutBoundProjectWorkspaceContext(input: {
+  context: Record<string, unknown>;
+  issueProjectId: string | null;
+  match: ReturnType<typeof selectCheckoutBoundExecutionWorkspacePolicy>;
+}) {
+  if (input.issueProjectId || !input.match) return;
+  if (!readNonEmptyString(input.context.projectId)) {
+    input.context.projectId = input.match.projectId;
+  }
+  if (!readNonEmptyString(input.context.projectWorkspaceId)) {
+    input.context.projectWorkspaceId = input.match.workspaceId;
+  }
+}
+
 export async function assertPushCapabilityCheckoutValid(input: {
   enabled: boolean;
   issue: {
@@ -15234,6 +15248,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueProjectId: executionProjectId,
       candidateCwds: checkoutPolicyCandidateCwds,
       workspaceRows: checkoutBoundWorkspaceRows,
+    });
+    applyCheckoutBoundProjectWorkspaceContext({
+      context,
+      issueProjectId: executionProjectId,
+      match: checkoutBoundPolicyMatch,
     });
     const parsedProjectExecutionWorkspacePolicy = parseProjectExecutionWorkspacePolicy(
       projectContext?.executionWorkspacePolicy,

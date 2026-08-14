@@ -45,6 +45,7 @@ import {
   shouldResetTaskSessionForWake,
   scrubGitCredentialText,
   selectCheckoutBoundExecutionWorkspacePolicy,
+  applyCheckoutBoundProjectWorkspaceContext,
   buildAnchorFallbackWorkspaceNotes,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
@@ -974,6 +975,69 @@ describe("selectCheckoutBoundExecutionWorkspacePolicy", () => {
       candidateCwds: ["/srv/paperclip-runtime"],
       workspaceRows: [servingWorkspace],
     })).toBeNull();
+  });
+});
+
+describe("applyCheckoutBoundProjectWorkspaceContext", () => {
+  it("hydrates project and workspace context from a checkout-bound match", () => {
+    const context: Record<string, unknown> = {};
+
+    applyCheckoutBoundProjectWorkspaceContext({
+      context,
+      issueProjectId: null,
+      match: {
+        projectId: "paperclip-runtime-project",
+        workspaceId: "paperclip-runtime-workspace",
+        cwd: "/srv/paperclip-runtime",
+        policy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "work/{{issue.identifier}}",
+            worktreeParentDir: "/paperclip/worktrees",
+          },
+        },
+      },
+    });
+
+    expect(context).toMatchObject({
+      projectId: "paperclip-runtime-project",
+      projectWorkspaceId: "paperclip-runtime-workspace",
+    });
+  });
+
+  it("does not overwrite an explicit issue project binding", () => {
+    const context: Record<string, unknown> = {
+      projectId: "explicit-project",
+      projectWorkspaceId: "explicit-workspace",
+    };
+
+    applyCheckoutBoundProjectWorkspaceContext({
+      context,
+      issueProjectId: "explicit-project",
+      match: {
+        projectId: "paperclip-runtime-project",
+        workspaceId: "paperclip-runtime-workspace",
+        cwd: "/srv/paperclip-runtime",
+        policy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "work/{{issue.identifier}}",
+            worktreeParentDir: "/paperclip/worktrees",
+          },
+        },
+      },
+    });
+
+    expect(context).toEqual({
+      projectId: "explicit-project",
+      projectWorkspaceId: "explicit-workspace",
+    });
   });
 });
 
