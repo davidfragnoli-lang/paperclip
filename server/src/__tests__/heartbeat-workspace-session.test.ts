@@ -44,6 +44,7 @@ import {
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
   scrubGitCredentialText,
+  selectCheckoutPolicyCandidateCwd,
   selectCheckoutBoundExecutionWorkspacePolicy,
   applyCheckoutBoundProjectWorkspaceContext,
   buildAnchorFallbackWorkspaceNotes,
@@ -1014,6 +1015,44 @@ describe("selectCheckoutBoundExecutionWorkspacePolicy", () => {
       candidateCwds: ["/srv/paperclip-runtime"],
       workspaceRows: [servingWorkspace],
     })).toBeNull();
+  });
+});
+
+describe("selectCheckoutPolicyCandidateCwd", () => {
+  it("binds a fresh project-less lane from its issue-scoped checkout override", () => {
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: null,
+      issueOverrideCwd: "/srv/paperclip-runtime",
+      taskSessionCwd: null,
+      agentConfigCwd: null,
+    })).toBe("/srv/paperclip-runtime");
+  });
+
+  it("uses the most specific declared checkout source", () => {
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: "/resume",
+      issueOverrideCwd: "/issue",
+      taskSessionCwd: "/session",
+      agentConfigCwd: "/agent",
+    })).toBe("/resume");
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: null,
+      issueOverrideCwd: "/issue",
+      taskSessionCwd: "/session",
+      agentConfigCwd: "/agent",
+    })).toBe("/issue");
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: null,
+      issueOverrideCwd: null,
+      taskSessionCwd: "/session",
+      agentConfigCwd: "/agent",
+    })).toBe("/session");
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: null,
+      issueOverrideCwd: null,
+      taskSessionCwd: null,
+      agentConfigCwd: "/agent",
+    })).toBe("/agent");
   });
 });
 

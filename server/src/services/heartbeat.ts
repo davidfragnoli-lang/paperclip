@@ -2048,6 +2048,21 @@ type CheckoutBoundWorkspacePolicyRow = {
   executionWorkspacePolicy: unknown;
 };
 
+export function selectCheckoutPolicyCandidateCwd(input: {
+  explicitResumeCwd: string | null | undefined;
+  issueOverrideCwd: string | null | undefined;
+  taskSessionCwd: string | null | undefined;
+  agentConfigCwd: string | null | undefined;
+}): string | null {
+  return (
+    readNonEmptyString(input.explicitResumeCwd) ??
+    readNonEmptyString(input.issueOverrideCwd) ??
+    readNonEmptyString(input.taskSessionCwd) ??
+    readNonEmptyString(input.agentConfigCwd) ??
+    null
+  );
+}
+
 export function selectCheckoutBoundExecutionWorkspacePolicy(input: {
   issueProjectId: string | null;
   candidateCwds: Array<string | null | undefined>;
@@ -15247,11 +15262,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       explicitResumeSessionParams ||
       isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId),
     );
-    const checkoutPolicyCandidateCwds = [
-      explicitResumeOverridesTaskSession
-        ? readNonEmptyString(explicitResumeSessionParams?.cwd)
-        : readNonEmptyString(taskSessionDecodedParams?.cwd),
-    ].filter((candidate): candidate is string => Boolean(candidate));
+    const checkoutPolicyCandidateCwd = selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: explicitResumeOverridesTaskSession
+        ? explicitResumeSessionParams?.cwd
+        : null,
+      issueOverrideCwd: issueAssigneeOverrides?.adapterConfig?.cwd,
+      taskSessionCwd: explicitResumeOverridesTaskSession
+        ? null
+        : taskSessionDecodedParams?.cwd,
+      agentConfigCwd: config.cwd,
+    });
+    const checkoutPolicyCandidateCwds = checkoutPolicyCandidateCwd
+      ? [checkoutPolicyCandidateCwd]
+      : [];
     const checkoutBoundWorkspaceRows = !executionProjectId && checkoutPolicyCandidateCwds.length > 0
       ? await db
           .select({
