@@ -2049,10 +2049,10 @@ type CheckoutBoundWorkspacePolicyRow = {
 };
 
 export function selectCheckoutPolicyCandidateCwd(input: {
-  explicitResumeCwd: string | null | undefined;
-  issueOverrideCwd: string | null | undefined;
-  taskSessionCwd: string | null | undefined;
-  agentConfigCwd: string | null | undefined;
+  explicitResumeCwd: unknown;
+  issueOverrideCwd: unknown;
+  taskSessionCwd: unknown;
+  agentConfigCwd: unknown;
 }): string | null {
   return (
     readNonEmptyString(input.explicitResumeCwd) ??
