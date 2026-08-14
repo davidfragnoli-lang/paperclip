@@ -2068,13 +2068,19 @@ export function selectCheckoutBoundExecutionWorkspacePolicy(input: {
   );
   if (candidateCwds.size === 0) return null;
 
-  for (const row of input.workspaceRows) {
+  const eligibleRows = input.workspaceRows.flatMap((row) => {
     const cwd = readNonEmptyString(row.cwd);
-    if (!cwd || !candidateCwds.has(path.resolve(cwd))) continue;
+    if (!cwd) return [];
     const policy = parseProjectExecutionWorkspacePolicy(row.executionWorkspacePolicy);
-    if (!policy?.enabled) continue;
-    if (policy.defaultMode !== "isolated_workspace" && policy.defaultMode !== "operator_branch") continue;
-    if (policy.workspaceStrategy?.type !== "git_worktree") continue;
+    if (!policy?.enabled) return [];
+    if (policy.defaultMode !== "isolated_workspace" && policy.defaultMode !== "operator_branch") return [];
+    if (policy.workspaceStrategy?.type !== "git_worktree") return [];
+    return [{ row, cwd, policy }];
+  });
+
+  const exactMatches = eligibleRows.filter(({ cwd }) => candidateCwds.has(path.resolve(cwd)));
+  if (exactMatches.length === 1) {
+    const [{ row, cwd, policy }] = exactMatches;
     return {
       projectId: row.projectId,
       workspaceId: row.workspaceId,
@@ -2082,8 +2088,31 @@ export function selectCheckoutBoundExecutionWorkspacePolicy(input: {
       policy,
     };
   }
+  if (exactMatches.length > 1) return null;
 
-  return null;
+  const worktreeParentMatches = new Map<string, (typeof eligibleRows)[number]>();
+  for (const candidateCwd of candidateCwds) {
+    for (const match of eligibleRows) {
+      const worktreeParentDir = readNonEmptyString(match.policy.workspaceStrategy?.worktreeParentDir);
+      if (!worktreeParentDir) continue;
+      const relative = path.relative(path.resolve(worktreeParentDir), candidateCwd);
+      if (relative && (relative.startsWith("..") || path.isAbsolute(relative))) continue;
+
+      const existing = worktreeParentMatches.get(match.row.projectId);
+      const defaultWorkspaceId = readNonEmptyString(match.policy.defaultProjectWorkspaceId);
+      if (!existing || match.row.workspaceId === defaultWorkspaceId) {
+        worktreeParentMatches.set(match.row.projectId, match);
+      }
+    }
+  }
+  if (worktreeParentMatches.size !== 1) return null;
+  const [{ row, cwd, policy }] = [...worktreeParentMatches.values()];
+  return {
+    projectId: row.projectId,
+    workspaceId: row.workspaceId,
+    cwd,
+    policy,
+  };
 }
 
 export function applyCheckoutBoundProjectWorkspaceContext(input: {
@@ -15223,10 +15252,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? readNonEmptyString(explicitResumeSessionParams?.cwd)
         : readNonEmptyString(taskSessionDecodedParams?.cwd),
     ].filter((candidate): candidate is string => Boolean(candidate));
-    const checkoutPolicyLookupCwds = [
-      ...new Set(checkoutPolicyCandidateCwds.flatMap((candidate) => [candidate, path.resolve(candidate)])),
-    ];
-    const checkoutBoundWorkspaceRows = !executionProjectId && checkoutPolicyLookupCwds.length > 0
+    const checkoutBoundWorkspaceRows = !executionProjectId && checkoutPolicyCandidateCwds.length > 0
       ? await db
           .select({
             projectId: projectWorkspaces.projectId,
@@ -15241,7 +15267,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ))
           .where(and(
             eq(projectWorkspaces.companyId, agent.companyId),
-            inArray(projectWorkspaces.cwd, checkoutPolicyLookupCwds),
+            isNotNull(projects.executionWorkspacePolicy),
           ))
       : [];
     const checkoutBoundPolicyMatch = selectCheckoutBoundExecutionWorkspacePolicy({

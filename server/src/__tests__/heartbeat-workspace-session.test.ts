@@ -961,6 +961,19 @@ describe("selectCheckoutBoundExecutionWorkspacePolicy", () => {
     });
   });
 
+  it("binds a resumed project-less lane from the configured worktree parent", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/paperclip/worktrees"],
+      workspaceRows: [servingWorkspace],
+    })).toEqual({
+      projectId: "paperclip-runtime-project",
+      workspaceId: "paperclip-runtime-workspace",
+      cwd: "/srv/paperclip-runtime",
+      policy: isolationPolicy,
+    });
+  });
+
   it("does not isolate a project-less lane resolved to an unrelated checkout", () => {
     expect(selectCheckoutBoundExecutionWorkspacePolicy({
       issueProjectId: null,
