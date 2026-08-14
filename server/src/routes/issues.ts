@@ -135,7 +135,7 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
-import { buildPlanReviewContext } from "../services/plan-review-context.js";
+import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
 import {
   decideIssueReviewPathRecovery,
   ISSUE_REVIEW_PATH_LOST_WAKE_REASON,
@@ -6121,6 +6121,12 @@ export function issueRoutes(
       issueWorkMode: issue.workMode,
       includeForIssueComment: wakeCommentId !== null,
     });
+    const documentReviewContext = await buildDocumentReviewContext({
+      db,
+      companyId: issue.companyId,
+      issueId: issue.id,
+      includeForIssueComment: wakeCommentId !== null,
+    });
 
     const response = {
       issue: {
@@ -6193,6 +6199,7 @@ export function issueRoutes(
           }
         : null,
       planReviewContext,
+      documentReviewContext,
       currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace),
     };
     res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, response));
