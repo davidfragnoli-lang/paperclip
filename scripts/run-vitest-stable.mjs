@@ -63,6 +63,7 @@ const allModeName = "all";
 const generalServerGroupName = "general-server";
 const generalWorkspacesAGroupName = "general-workspaces-a";
 const generalWorkspacesBGroupName = "general-workspaces-b";
+const localGeneralServerShardCount = 5;
 const generalWorkspacesAProjects = ["@paperclipai/ui", "paperclipai"];
 const generalWorkspacesBProjects = nonServerProjects.filter((project) => !generalWorkspacesAProjects.includes(project));
 const generalGroupNames = [generalServerGroupName, generalWorkspacesAGroupName, generalWorkspacesBGroupName];
@@ -267,6 +268,34 @@ function runVitest(args, label) {
     PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-${invocationIndex}`,
     TMPDIR: path.join(testRoot, "t"),
   };
+  // Heartbeat-launched verification inherits live control-plane and workspace
+  // coordinates. They are production inputs, not test fixtures, and can make
+  // suites target the live runtime or shared worktree roots. Keep only the
+  // per-invocation PAPERCLIP_HOME/INSTANCE_ID defined above.
+  for (const key of Object.keys(env)) {
+    if (
+      key.startsWith("PAPERCLIP_WORKSPACE_") ||
+      key.startsWith("PAPERCLIP_WAKE_") ||
+      [
+        "PAPERCLIP_AGENT_ID",
+        "PAPERCLIP_API_KEY",
+        "PAPERCLIP_API_URL",
+        "PAPERCLIP_COMPANY_ID",
+        "PAPERCLIP_ISSUE_WORK_MODE",
+        "PAPERCLIP_LISTEN_HOST",
+        "PAPERCLIP_LISTEN_PORT",
+        "PAPERCLIP_RUNTIME_API_URL",
+        "PAPERCLIP_RUN_ID",
+        "PAPERCLIP_RUN_SCRATCH_DIR",
+        "PAPERCLIP_SCRATCH_DIR",
+        "PAPERCLIP_TASK_ID",
+        "PAPERCLIP_TASK_SCRATCH_DIR",
+        "PAPERCLIP_TMPDIR",
+      ].includes(key)
+    ) {
+      delete env[key];
+    }
+  }
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
   const result = spawnSync("pnpm", ["exec", "vitest", "run", ...args], {
@@ -304,6 +333,24 @@ function runProjectGroup(projects, groupName, shardIndex = null, shardCount = nu
 
 function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = null) {
   if (groupName === generalServerGroupName) {
+    if (shardCount === null) {
+      // The default local/full-suite path must use the same explicit allowlist
+      // as CI shards. A single broad project invocation relies on a long list
+      // of CLI --exclude flags; route suites have leaked through that boundary
+      // and failed late after thousands of unrelated tests had accumulated
+      // process state. Sequential shards keep local resource use bounded while
+      // preserving complete, non-overlapping coverage.
+      for (let localShardIndex = 0; localShardIndex < localGeneralServerShardCount; localShardIndex += 1) {
+        runGeneralGroup(
+          routeTests,
+          groupName,
+          localShardIndex,
+          localGeneralServerShardCount,
+        );
+      }
+      return;
+    }
+
     if (shardCount !== null && shardCount > 1) {
       const shardFiles = selectGeneralServerShard(
         generalServerTestFiles,
@@ -330,15 +377,20 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
       return;
     }
 
-    const excludeRouteArgs = routeTests.flatMap((file) => ["--exclude", file.serverPath]);
+    const shardFiles = selectGeneralServerShard(
+      generalServerTestFiles,
+      shardIndex ?? 0,
+      1,
+      generalServerShardDurations,
+    );
     runVitest(
       [
         "--project",
         "@paperclipai/server",
         ...serializedServerVitestArgs,
-        ...excludeRouteArgs,
+        ...shardFiles,
       ],
-      `${groupName} server suites excluding ${routeTests.length} serialized suites`,
+      `${groupName} explicit server suite allowlist`,
     );
     return;
   }
@@ -417,6 +469,8 @@ if (options.dryRun) {
         availableGeneralGroups: generalGroupNames,
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
+        generalServerExcludePatterns: routeTests.map((routeTest) => routeTest.repoPath),
+        localGeneralServerShardCount,
         generalServerSuiteCount: generalServerTestFiles.length,
         selectedGeneralServerSuites:
           options.mode === generalModeName &&

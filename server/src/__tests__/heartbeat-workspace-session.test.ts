@@ -44,6 +44,7 @@ import {
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
   scrubGitCredentialText,
+  selectCheckoutBoundExecutionWorkspacePolicy,
   buildAnchorFallbackWorkspaceNotes,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
@@ -925,6 +926,54 @@ describe("buildAnchorFallbackWorkspaceNotes", () => {
       'Failed to prepare the project workspace checkout: authentication failed. Using fallback workspace "/fallback" for this run.',
       'Project workspace path "/missing/path" is not available yet. Using fallback workspace "/fallback" for this run.',
     ]);
+  });
+});
+
+describe("selectCheckoutBoundExecutionWorkspacePolicy", () => {
+  const isolationPolicy = {
+    enabled: true,
+    defaultMode: "isolated_workspace",
+    allowIssueOverride: false,
+    workspaceStrategy: {
+      type: "git_worktree",
+      branchTemplate: "work/{{issue.identifier}}",
+      worktreeParentDir: "/paperclip/worktrees",
+    },
+  };
+  const servingWorkspace = {
+    projectId: "paperclip-runtime-project",
+    workspaceId: "paperclip-runtime-workspace",
+    cwd: "/srv/paperclip-runtime",
+    executionWorkspacePolicy: isolationPolicy,
+  };
+
+  it("binds a project-less lane to the isolation policy of its resolved checkout", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/srv/paperclip-runtime"],
+      workspaceRows: [servingWorkspace],
+    })).toEqual({
+      projectId: "paperclip-runtime-project",
+      workspaceId: "paperclip-runtime-workspace",
+      cwd: "/srv/paperclip-runtime",
+      policy: isolationPolicy,
+    });
+  });
+
+  it("does not isolate a project-less lane resolved to an unrelated checkout", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/srv/unrelated-repo"],
+      workspaceRows: [servingWorkspace],
+    })).toBeNull();
+  });
+
+  it("keeps project membership authoritative when the issue is already tagged", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: "other-project",
+      candidateCwds: ["/srv/paperclip-runtime"],
+      workspaceRows: [servingWorkspace],
+    })).toBeNull();
   });
 });
 

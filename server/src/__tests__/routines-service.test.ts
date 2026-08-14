@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -16,6 +16,7 @@ import {
   heartbeatRuns,
   instanceSettings,
   issueInboxArchives,
+  issueComments,
   issues,
   projectWorkspaces,
   projects,
@@ -35,6 +36,11 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import * as providerRegistry from "../secrets/provider-registry.ts";
 import { routineService } from "../services/routines.ts";
 import { secretService } from "../services/secrets.ts";
+import { agentService } from "../services/agents.ts";
+import {
+  AGENT_NOT_INVOKABLE_FAILURE_REASON,
+  evaluateAgentInvokability,
+} from "../services/agent-invokability.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -75,6 +81,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
     await db.delete(heartbeatRuns);
+    await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
@@ -238,6 +245,123 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .returning()
       .then((rows) => rows[0]!);
   }
+
+  it("replays exactly the newest pause-refused occurrence per routine once", async () => {
+    const { companyId, agentId, projectId, routine, svc } = await seedFixture();
+    const secondRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "second paused routine",
+        description: "Run the second paused routine",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+    const pausedAt = new Date("2026-08-10T10:00:00.000Z");
+    const resumedAt = new Date("2026-08-10T13:00:00.000Z");
+
+    await db.insert(routineRuns).values([
+      {
+        companyId,
+        routineId: routine.id,
+        source: "schedule",
+        status: "failed",
+        triggeredAt: new Date("2026-08-10T11:00:00.000Z"),
+        completedAt: new Date("2026-08-10T11:00:00.000Z"),
+        failureReason: AGENT_NOT_INVOKABLE_FAILURE_REASON,
+        triggerPayload: { occurrence: "older" },
+      },
+      {
+        companyId,
+        routineId: routine.id,
+        source: "schedule",
+        status: "failed",
+        triggeredAt: new Date("2026-08-10T12:00:00.000Z"),
+        completedAt: new Date("2026-08-10T12:00:00.000Z"),
+        failureReason: AGENT_NOT_INVOKABLE_FAILURE_REASON,
+        triggerPayload: { occurrence: "newest" },
+      },
+      {
+        companyId,
+        routineId: secondRoutine.id,
+        source: "schedule",
+        status: "failed",
+        triggeredAt: new Date("2026-08-10T12:30:00.000Z"),
+        completedAt: new Date("2026-08-10T12:30:00.000Z"),
+        failureReason: AGENT_NOT_INVOKABLE_FAILURE_REASON,
+        triggerPayload: { occurrence: "second" },
+      },
+    ]);
+
+    const first = await svc.catchUpPauseRefusedRuns({ agentId, pausedAt, resumedAt });
+    const second = await svc.catchUpPauseRefusedRuns({ agentId, pausedAt, resumedAt });
+
+    expect(first).toHaveLength(2);
+    expect(second.map((run) => run.catchUpRunId).sort()).toEqual(first.map((run) => run.catchUpRunId).sort());
+    const allRuns = await db.select().from(routineRuns).where(inArray(routineRuns.routineId, [routine.id, secondRoutine.id]));
+    const catchUpRuns = allRuns.filter((run) => run.idempotencyKey?.startsWith("agent-resume-catch-up:"));
+    expect(catchUpRuns).toHaveLength(2);
+    expect(catchUpRuns.every((run) => run.status !== "failed")).toBe(true);
+    expect(catchUpRuns.find((run) => run.routineId === routine.id)?.triggerPayload).toMatchObject({
+      occurrence: "newest",
+    });
+  });
+
+  it("recovers pause-refused runs through the agent resume default arm", async () => {
+    const { companyId, agentId, routine, svc } = await seedFixture();
+    const pausedAt = new Date("2026-08-10T10:00:00.000Z");
+    const resumedAt = new Date("2026-08-10T13:00:00.000Z");
+    const triggerPayload = { occurrence: "shared-resume" };
+    const activeRun = await svc.runRoutine(routine.id, {
+      source: "api",
+      payload: triggerPayload,
+    });
+    expect(activeRun.status).toBe("issue_created");
+    const pausedAgent = {
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      reportsTo: null,
+      status: "paused" as const,
+    };
+    const refusal = evaluateAgentInvokability(pausedAgent, [pausedAgent]);
+    expect(refusal).toMatchObject({
+      invokable: false,
+      message: AGENT_NOT_INVOKABLE_FAILURE_REASON,
+    });
+    if (refusal.invokable) throw new Error("Expected paused agent to be non-invokable");
+
+    await db
+      .update(agents)
+      .set({ status: "paused", pauseReason: "manual", pausedAt })
+      .where(eq(agents.id, agentId));
+    await db.insert(routineRuns).values({
+      companyId,
+      routineId: routine.id,
+      source: "schedule",
+      status: "failed",
+      triggeredAt: new Date("2026-08-10T12:00:00.000Z"),
+      completedAt: new Date("2026-08-10T12:00:00.000Z"),
+      failureReason: refusal.message,
+      triggerPayload,
+    });
+
+    await agentService(db).resume(agentId, { now: resumedAt });
+
+    const catchUpRuns = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.routineId, routine.id));
+    expect(catchUpRuns.filter((run) => run.idempotencyKey?.startsWith("agent-resume-catch-up:")))
+      .toHaveLength(1);
+  });
 
   it("filters listed routines by project", async () => {
     const { companyId, agentId, projectId, routine, svc } = await seedFixture();
@@ -1260,6 +1384,128 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(routineIssues).toHaveLength(1);
     expect(routineIssues[0]?.id).toBe(previousIssue.id);
+    await expect(
+      db.select().from(issueComments).where(eq(issueComments.issueId, previousIssue.id)),
+    ).resolves.toHaveLength(0);
+  });
+
+  it("cancels and links an idle predecessor before publishing its successor", async () => {
+    const { companyId, routine, svc } = await seedFixture();
+    const firstRun = await svc.runRoutine(routine.id, { source: "manual" });
+    const predecessorId = firstRun.linkedIssueId!;
+    const [predecessorBefore] = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, predecessorId));
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "completed", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, predecessorBefore!.executionRunId!));
+
+    const secondRun = await svc.runRoutine(routine.id, { source: "manual" });
+    const successorId = secondRun.linkedIssueId!;
+    const [predecessor, successor] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, predecessorId)).then((rows) => rows[0]!),
+      db.select().from(issues).where(eq(issues.id, successorId)).then((rows) => rows[0]!),
+    ]);
+    const predecessorComments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, predecessorId));
+
+    expect(secondRun.status).toBe("issue_created");
+    expect(successorId).not.toBe(predecessorId);
+    expect(predecessor.status).toBe("cancelled");
+    expect(predecessor.executionRunId).toBeNull();
+    expect(successor.status).toBe("todo");
+    expect(predecessorComments).toEqual([
+      expect.objectContaining({
+        authorType: "system",
+        body: `Superseded by [${successor.identifier}](/${successor.identifier.split("-", 1)[0]}/issues/${successor.identifier}) for the next execution of this routine.`,
+      }),
+    ]);
+
+    const openRoutineIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id))
+      .then((rows) => rows.filter((issue) => issue.id !== predecessorId));
+    expect(openRoutineIssues).toEqual([{ id: successorId }]);
+  });
+
+  it("does not cancel idle carriers from another routine or dispatch fingerprint", async () => {
+    const { companyId, agentId, projectId, svc } = await seedFixture();
+    const variableRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "triage {{mailbox}}",
+        description: "Fresh ingest for {{mailbox}}",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+        variables: [
+          { name: "mailbox", label: null, type: "text", defaultValue: null, required: true, options: [] },
+        ],
+      },
+      {},
+    );
+    const otherRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "other mailbox",
+        description: "Other routine",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    const firstA = await svc.runRoutine(variableRoutine.id, {
+      source: "manual",
+      variables: { mailbox: "gmail" },
+    });
+    const firstB = await svc.runRoutine(variableRoutine.id, {
+      source: "manual",
+      variables: { mailbox: "outlook" },
+    });
+    const other = await svc.runRoutine(otherRoutine.id, { source: "manual" });
+
+    const carrierIds = [firstA.linkedIssueId!, firstB.linkedIssueId!, other.linkedIssueId!];
+    const carrierRuns = await db
+      .select({ id: issues.id, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(inArray(issues.id, carrierIds));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "completed", finishedAt: new Date() })
+      .where(inArray(heartbeatRuns.id, carrierRuns.map((row) => row.executionRunId!)));
+
+    const successorA = await svc.runRoutine(variableRoutine.id, {
+      source: "manual",
+      variables: { mailbox: "gmail" },
+    });
+    const statuses = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(inArray(issues.id, [...carrierIds, successorA.linkedIssueId!]));
+    const statusById = new Map(statuses.map((row) => [row.id, row.status]));
+
+    expect(statusById.get(firstA.linkedIssueId!)).toBe("cancelled");
+    expect(statusById.get(firstB.linkedIssueId!)).toBe("todo");
+    expect(statusById.get(other.linkedIssueId!)).toBe("todo");
+    expect(statusById.get(successorA.linkedIssueId!)).toBe("todo");
   });
 
   it("touches a coalesced routine issue for the manual runner's inbox", async () => {

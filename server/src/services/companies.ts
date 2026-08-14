@@ -38,6 +38,7 @@ import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
+import { recoverPauseRefusedRoutineRuns } from "./pause-dispatch-recovery.js";
 
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -55,7 +56,10 @@ const SYSTEM_COMPANY_ACTOR: CompanyActivityActor = {
   runId: null,
 };
 
-export function companyService(db: Db) {
+export function companyService(
+  db: Db,
+  deps: { recoverPauseDispatches?: typeof recoverPauseRefusedRoutineRuns } = {},
+) {
   const ISSUE_PREFIX_FALLBACK = "CMP";
   const environmentsSvc = environmentService(db);
   const heartbeat = heartbeatService(db);
@@ -321,9 +325,17 @@ export function companyService(db: Db) {
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
 
-        let agentsRestored = 0;
+        let restoredAgents: Array<{ id: string; pausedAt: Date | null }> = [];
         if (willReactivate) {
-          const restoredRows = await tx
+          restoredAgents = await tx
+            .select({ id: agents.id, pausedAt: agents.pausedAt })
+            .from(agents)
+            .where(and(
+              eq(agents.companyId, id),
+              eq(agents.status, "paused"),
+              eq(agents.pauseReason, "company_archived"),
+            ));
+          await tx
             .update(agents)
             .set({
               status: "idle",
@@ -335,9 +347,7 @@ export function companyService(db: Db) {
               eq(agents.companyId, id),
               eq(agents.status, "paused"),
               eq(agents.pauseReason, "company_archived"),
-            ))
-            .returning({ id: agents.id });
-          agentsRestored = restoredRows.length;
+            ));
         }
 
         const archiveCascade = willArchive ? await applyArchiveCascadeInTx(tx, id) : null;
@@ -370,16 +380,27 @@ export function companyService(db: Db) {
         }], tx);
 
         const shouldLogReactivation = willReactivate &&
-          (existing.status === "archived" || agentsRestored > 0);
+          (existing.status === "archived" || restoredAgents.length > 0);
 
         return {
           company: enrichCompany(hydrated),
-          reactivated: shouldLogReactivation ? { agentsRestored } : null,
+          reactivated: shouldLogReactivation
+            ? { agentsRestored: restoredAgents.length, restoredAgents }
+            : null,
           archiveCascade,
         };
       });
       if (!result) return null;
       if (result.reactivated) {
+        const resumedAt = new Date();
+        for (const restoredAgent of result.reactivated.restoredAgents) {
+          if (!restoredAgent.pausedAt) continue;
+          await (deps.recoverPauseDispatches ?? recoverPauseRefusedRoutineRuns)(db, {
+            agentId: restoredAgent.id,
+            pausedAt: restoredAgent.pausedAt,
+            resumedAt,
+          });
+        }
         await logActivity(db, {
           companyId: id,
           actorType: actor.actorType,

@@ -35,6 +35,14 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import {
+  buildIssueMonitorPauseShiftPatch,
+  normalizeIssueExecutionPolicy,
+} from "./issue-execution-policy.js";
+import {
+  recoverPauseRefusedRoutineRuns,
+  type PauseDispatchRecoveryInput,
+} from "./pause-dispatch-recovery.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -278,7 +286,12 @@ export function deduplicateAgentName(
   return `${candidateName} ${Date.now()}`;
 }
 
-export function agentService(db: Db) {
+export function agentService(
+  db: Db,
+  deps: {
+    recoverPauseDispatches?: (input: PauseDispatchRecoveryInput) => Promise<unknown[]>;
+  } = {},
+) {
   const secretsSvc = secretService(db);
 
   function currentUtcMonthWindow(now = new Date()) {
@@ -659,7 +672,7 @@ export function agentService(db: Db) {
       return updated ? getById(updated.id) : null;
     },
 
-    resume: async (id: string) => {
+    resume: async (id: string, options?: { now?: Date }) => {
       const existing = await getById(id);
       if (!existing) return null;
       if (existing.status === "terminated") throw conflict("Cannot resume terminated agent");
@@ -667,18 +680,59 @@ export function agentService(db: Db) {
         throw conflict("Pending approval agents cannot be resumed");
       }
 
-      const updated = await db
-        .update(agents)
-        .set({
-          status: "idle",
-          pauseReason: null,
-          pausedAt: null,
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const resumedAt = options?.now ?? new Date();
+      const updated = await db.transaction(async (tx) => {
+        const resumed = await tx
+          .update(agents)
+          .set({
+            status: "idle",
+            pauseReason: null,
+            pausedAt: null,
+            errorReason: null,
+            updatedAt: resumedAt,
+          })
+          .where(eq(agents.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+
+        if (resumed && existing.pausedAt) {
+          const monitoredIssues = await tx
+            .select()
+            .from(issues)
+            .where(
+              and(
+                eq(issues.assigneeAgentId, id),
+                inArray(issues.status, ["in_progress", "in_review"]),
+                sql`${issues.monitorNextCheckAt} is not null`,
+              ),
+            );
+          for (const issue of monitoredIssues) {
+            await tx
+              .update(issues)
+              .set({
+                ...buildIssueMonitorPauseShiftPatch({
+                  issue,
+                  policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+                  pausedAt: existing.pausedAt,
+                  resumedAt,
+                }),
+                updatedAt: resumedAt,
+              })
+              .where(eq(issues.id, issue.id));
+          }
+        }
+
+        return resumed;
+      });
+      if (updated && existing.pausedAt) {
+        const recover = deps.recoverPauseDispatches ?? ((input: PauseDispatchRecoveryInput) =>
+          recoverPauseRefusedRoutineRuns(db, input));
+        await recover({
+          agentId: id,
+          pausedAt: existing.pausedAt,
+          resumedAt,
+        });
+      }
       return updated ? getById(updated.id) : null;
     },
 

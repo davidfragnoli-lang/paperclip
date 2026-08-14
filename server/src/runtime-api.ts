@@ -52,15 +52,6 @@ export function choosePrimaryRuntimeApiUrl(input: {
   bindHost: string;
   port: number;
 }): string {
-  const explicitPublicBaseUrl = input.authPublicBaseUrl?.trim();
-  if (explicitPublicBaseUrl) {
-    try {
-      return new URL(explicitPublicBaseUrl).origin;
-    } catch {
-      // Fall through to derived candidates if config parsing drifted.
-    }
-  }
-
   const bindHost = normalizeHost(input.bindHost);
   if (bindHost && !isWildcardHost(bindHost) && isLoopbackHost(bindHost)) {
     return formatOrigin("http:", bindHost, input.port);
@@ -127,31 +118,29 @@ export function buildRuntimeApiCandidateUrls(input: {
       return null;
     }
   })();
-  const protocol = explicitOrigin ? new URL(explicitOrigin).protocol : "http:";
-
   pushCandidate(candidates, seen, input.preferredApiUrl);
   pushCandidate(candidates, seen, explicitOrigin);
 
   for (const rawHost of input.allowedHostnames) {
     const host = normalizeHost(rawHost);
     if (!host) continue;
-    pushCandidate(candidates, seen, formatOrigin(protocol, host, input.port));
+    pushCandidate(candidates, seen, formatOrigin("http:", host, input.port));
   }
 
   const bindHost = normalizeHost(input.bindHost);
   if (bindHost && !isWildcardHost(bindHost)) {
-    pushCandidate(candidates, seen, formatOrigin(protocol, bindHost, input.port));
+    pushCandidate(candidates, seen, formatOrigin("http:", bindHost, input.port));
   }
 
   if (explicitOrigin) {
     const hostname = new URL(explicitOrigin).hostname;
     if (isLoopbackHost(hostname)) {
-      pushCandidate(candidates, seen, formatOrigin(protocol, "host.docker.internal", input.port));
+      pushCandidate(candidates, seen, formatOrigin("http:", "host.docker.internal", input.port));
     }
   }
 
   for (const host of collectReachableInterfaceHosts({ networkInterfacesMap: input.networkInterfacesMap })) {
-    pushCandidate(candidates, seen, formatOrigin(protocol, host, input.port));
+    pushCandidate(candidates, seen, formatOrigin("http:", host, input.port));
   }
 
   if (candidates.length === 0) {

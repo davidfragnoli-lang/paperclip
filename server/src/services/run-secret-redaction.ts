@@ -14,7 +14,9 @@ type RegistryEntry = {
 };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null
     ? value as Record<string, unknown>
     : null;
 }

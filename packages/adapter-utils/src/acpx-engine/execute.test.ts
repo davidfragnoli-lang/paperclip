@@ -548,6 +548,9 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(prompt).toContain("PAPERCLIP_WAKE_PAYLOAD_JSON");
     expect(prompt).toContain("Paperclip API access note:");
     expect(prompt).toContain('PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"; PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"');
+    expect(prompt).toContain("Treat the request as successful only when it returns HTTP 200 with content-type application/json");
+    expect(prompt).toContain("an HTTP 200 text/html response is an access login page, not the API");
+    expect(prompt).toContain("curl -sS -D -");
     expect(prompt).toContain("$PAPERCLIP_API_BASE/api/agents/me");
     expect(prompt).toContain("$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID");
     expect(prompt).toContain("X-Paperclip-Run-Id");
@@ -2028,6 +2031,67 @@ describe("gemini ACP flag selection", () => {
     expect(result.errorMessage).toBe(expectedMessage);
     expect(cancelReasons).toContain(expectedMessage);
   }, 15_000);
+
+  it("emits acpx_stream_idle_timeout when an ACP turn stops producing events", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const cancelReasons: string[] = [];
+
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            yield { type: "text_delta", text: "started", stream: "output", tag: "agent_message_chunk" };
+            await turnCancelled;
+          })(),
+          result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+          cancel: async ({ reason }: { reason: string }) => {
+            cancelReasons.push(reason);
+            releaseTurn?.();
+          },
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-stream-idle-timeout",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        cwd,
+        streamIdleTimeoutMs: 40,
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.timedOut).toBe(false);
+    expect(result.errorCode).toBe("acpx_stream_idle_timeout");
+    expect(result.errorMessage).toBe("monitor: no ACP stream event for 0m 0s");
+    expect(result.clearSession).toBe(true);
+    expect(result.resultJson).toMatchObject({
+      streamIdleTimeout: { timeoutMs: 40 },
+    });
+    expect(cancelReasons).toContain("monitor: no ACP stream event for 0m 0s");
+  });
 });
 
 describe("summarizeAcpxTurnUsage", () => {
