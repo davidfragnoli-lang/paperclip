@@ -22,6 +22,7 @@ import {
   type IssueExecutionMonitorPolicy,
   type IssueExecutionMonitorRecoveryPolicy,
   type ModelProfileKey,
+  type ProjectExecutionWorkspacePolicy,
   type RequestConfirmationResult,
   type RoutineRevisionSnapshotV1,
   type RunLivenessState,
@@ -2038,6 +2039,51 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
       { baseCwdFallback: true, materializationFailures },
     );
   }
+}
+
+type CheckoutBoundWorkspacePolicyRow = {
+  projectId: string;
+  workspaceId: string;
+  cwd: string | null;
+  executionWorkspacePolicy: unknown;
+};
+
+export function selectCheckoutBoundExecutionWorkspacePolicy(input: {
+  issueProjectId: string | null;
+  candidateCwds: Array<string | null | undefined>;
+  workspaceRows: CheckoutBoundWorkspacePolicyRow[];
+}): {
+  projectId: string;
+  workspaceId: string;
+  cwd: string;
+  policy: ProjectExecutionWorkspacePolicy;
+} | null {
+  if (input.issueProjectId) return null;
+
+  const candidateCwds = new Set(
+    input.candidateCwds
+      .map((candidate) => readNonEmptyString(candidate))
+      .filter((candidate): candidate is string => Boolean(candidate))
+      .map((candidate) => path.resolve(candidate)),
+  );
+  if (candidateCwds.size === 0) return null;
+
+  for (const row of input.workspaceRows) {
+    const cwd = readNonEmptyString(row.cwd);
+    if (!cwd || !candidateCwds.has(path.resolve(cwd))) continue;
+    const policy = parseProjectExecutionWorkspacePolicy(row.executionWorkspacePolicy);
+    if (!policy?.enabled) continue;
+    if (policy.defaultMode !== "isolated_workspace" && policy.defaultMode !== "operator_branch") continue;
+    if (policy.workspaceStrategy?.type !== "git_worktree") continue;
+    return {
+      projectId: row.projectId,
+      workspaceId: row.workspaceId,
+      cwd,
+      policy,
+    };
+  }
+
+  return null;
 }
 
 export async function assertPushCapabilityCheckoutValid(input: {
@@ -15138,32 +15184,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueContext.id), isNull(issues.responsibleUserId)));
       issueContext = { ...issueContext, responsibleUserId };
     }
-    const parsedProjectExecutionWorkspacePolicy = parseProjectExecutionWorkspacePolicy(
-      projectContext?.executionWorkspacePolicy,
-    );
-    const projectExecutionWorkspacePolicy = gateProjectExecutionWorkspacePolicy(
-      parsedProjectExecutionWorkspacePolicy,
-      isolatedWorkspacesEnabled,
-    );
-    const trustPreset = resolveCoreTrustPreset({
-      companyId: agent.companyId,
-      agent: {
-        companyId: agent.companyId,
-        permissions: agent.permissions,
-      },
-      project: projectContext
-        ? {
-            companyId: agent.companyId,
-            executionWorkspacePolicy: projectExecutionWorkspacePolicy,
-          }
-        : null,
-      issue: issueContext
-        ? {
-            companyId: agent.companyId,
-            executionPolicy: issueContext.executionPolicy,
-          }
-        : null,
-    });
     const config = parseObject(agent.adapterConfig);
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
@@ -15180,6 +15200,67 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(explicitResumeSessionParams) : null) ??
         readNonEmptyString(explicitResumeSessionParams?.sessionId),
     );
+    const explicitResumeOverridesTaskSession = Boolean(
+      explicitResumeSessionParams ||
+      isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId),
+    );
+    const checkoutPolicyCandidateCwds = [
+      explicitResumeOverridesTaskSession
+        ? readNonEmptyString(explicitResumeSessionParams?.cwd)
+        : readNonEmptyString(taskSessionDecodedParams?.cwd),
+    ].filter((candidate): candidate is string => Boolean(candidate));
+    const checkoutPolicyLookupCwds = [
+      ...new Set(checkoutPolicyCandidateCwds.flatMap((candidate) => [candidate, path.resolve(candidate)])),
+    ];
+    const checkoutBoundWorkspaceRows = !executionProjectId && checkoutPolicyLookupCwds.length > 0
+      ? await db
+          .select({
+            projectId: projectWorkspaces.projectId,
+            workspaceId: projectWorkspaces.id,
+            cwd: projectWorkspaces.cwd,
+            executionWorkspacePolicy: projects.executionWorkspacePolicy,
+          })
+          .from(projectWorkspaces)
+          .innerJoin(projects, and(
+            eq(projects.id, projectWorkspaces.projectId),
+            eq(projects.companyId, projectWorkspaces.companyId),
+          ))
+          .where(and(
+            eq(projectWorkspaces.companyId, agent.companyId),
+            inArray(projectWorkspaces.cwd, checkoutPolicyLookupCwds),
+          ))
+      : [];
+    const checkoutBoundPolicyMatch = selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: executionProjectId,
+      candidateCwds: checkoutPolicyCandidateCwds,
+      workspaceRows: checkoutBoundWorkspaceRows,
+    });
+    const parsedProjectExecutionWorkspacePolicy = parseProjectExecutionWorkspacePolicy(
+      projectContext?.executionWorkspacePolicy,
+    );
+    const projectExecutionWorkspacePolicy = gateProjectExecutionWorkspacePolicy(
+      parsedProjectExecutionWorkspacePolicy ?? checkoutBoundPolicyMatch?.policy ?? null,
+      isolatedWorkspacesEnabled,
+    );
+    const trustPreset = resolveCoreTrustPreset({
+      companyId: agent.companyId,
+      agent: {
+        companyId: agent.companyId,
+        permissions: agent.permissions,
+      },
+      project: projectContext ?? checkoutBoundPolicyMatch
+        ? {
+            companyId: agent.companyId,
+            executionWorkspacePolicy: projectExecutionWorkspacePolicy,
+          }
+        : null,
+      issue: issueContext
+        ? {
+            companyId: agent.companyId,
+            executionPolicy: issueContext.executionPolicy,
+          }
+        : null,
+    });
     const resolvedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
