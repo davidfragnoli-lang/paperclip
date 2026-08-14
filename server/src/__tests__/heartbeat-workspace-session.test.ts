@@ -974,6 +974,32 @@ describe("selectCheckoutBoundExecutionWorkspacePolicy", () => {
     });
   });
 
+  it("normalizes dot segments and trailing separators before matching a checkout", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/srv/checkouts/../paperclip-runtime/./"],
+      workspaceRows: [servingWorkspace],
+    })).toEqual({
+      projectId: "paperclip-runtime-project",
+      workspaceId: "paperclip-runtime-workspace",
+      cwd: "/srv/paperclip-runtime",
+      policy: isolationPolicy,
+    });
+  });
+
+  it("normalizes a nested resumed-worktree path before matching its configured parent", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/paperclip/worktrees/./FRA-24146/../FRA-24146/"],
+      workspaceRows: [servingWorkspace],
+    })).toEqual({
+      projectId: "paperclip-runtime-project",
+      workspaceId: "paperclip-runtime-workspace",
+      cwd: "/srv/paperclip-runtime",
+      policy: isolationPolicy,
+    });
+  });
+
   it("does not isolate a project-less lane resolved to an unrelated checkout", () => {
     expect(selectCheckoutBoundExecutionWorkspacePolicy({
       issueProjectId: null,
