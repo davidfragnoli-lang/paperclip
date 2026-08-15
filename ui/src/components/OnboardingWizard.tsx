@@ -143,21 +143,21 @@ Propose, don't decide. Keep it conversational.`;
 const onboardingDraftStorage = {
   read(): string | null {
     try {
-      return window.localStorage.getItem(ONBOARDING_STORAGE_KEY);
+      return localStorage.getItem(ONBOARDING_STORAGE_KEY);
     } catch {
       return null;
     }
   },
   write(value: string): void {
     try {
-      window.localStorage.setItem(ONBOARDING_STORAGE_KEY, value);
+      localStorage.setItem(ONBOARDING_STORAGE_KEY, value);
     } catch {
       // Storage unavailable: the draft is simply not resumable this session.
     }
   },
   clear(): void {
     try {
-      window.localStorage.removeItem(ONBOARDING_STORAGE_KEY);
+      localStorage.removeItem(ONBOARDING_STORAGE_KEY);
     } catch {
       // Nothing to do. A draft that cannot be cleared is re-rejected on the
       // next load by the same ownership check that rejected it here.
