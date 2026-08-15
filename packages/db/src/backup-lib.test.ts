@@ -52,6 +52,16 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 describe("createBufferedTextFileWriter", () => {
+  it("does not open a temporary file when aborted before the first write", async () => {
+    const tempDir = createTempDir("paperclip-buffered-writer-abort-");
+    const outputPath = path.join(tempDir, "backup.sql");
+    const writer = createBufferedTextFileWriter(outputPath, 16);
+
+    await writer.abort();
+
+    expect(fs.existsSync(outputPath)).toBe(false);
+  });
+
   it("preserves line boundaries across buffered flushes", async () => {
     const tempDir = createTempDir("paperclip-buffered-writer-");
     const outputPath = path.join(tempDir, "backup.sql");

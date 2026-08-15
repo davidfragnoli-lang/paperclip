@@ -443,7 +443,8 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
 }
 
 export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES) {
-  const filePromise = openFile(filePath, "w");
+  let filePromise: ReturnType<typeof openFile> | null = null;
+  let fileHandle: Awaited<ReturnType<typeof openFile>> | null = null;
   const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
   let bufferedLines: string[] = [];
   let bufferedBytes = 0;
@@ -451,8 +452,15 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
   let closed = false;
   let pendingWrite = Promise.resolve();
 
+  const getFile = async () => {
+    if (fileHandle) return fileHandle;
+    filePromise ??= openFile(filePath, "w");
+    fileHandle = await filePromise;
+    return fileHandle;
+  };
+
   const writeChunk = async (chunk: string | Buffer): Promise<void> => {
-    const file = await filePromise;
+    const file = await getFile();
     if (typeof chunk === "string") {
       await file.write(chunk, null, "utf8");
     } else {
@@ -503,8 +511,11 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       closed = true;
       flushBufferedLines();
       await pendingWrite;
-      const file = await filePromise;
-      await file.close();
+      if (filePromise) {
+        const file = await getFile();
+        await file.close();
+        fileHandle = null;
+      }
     },
     async abort() {
       if (closed) return;
@@ -512,7 +523,10 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       bufferedLines = [];
       bufferedBytes = 0;
       await pendingWrite.catch(() => {});
-      await filePromise.then((file) => file.close()).catch(() => {});
+      if (filePromise) {
+        await getFile().then((file) => file.close()).catch(() => {});
+        fileHandle = null;
+      }
       if (existsSync(filePath)) {
         try {
           unlinkSync(filePath);
