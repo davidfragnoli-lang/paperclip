@@ -46,6 +46,7 @@ function redactedDatabaseBackupWarning(warning: DatabaseBackupHealthWarning): Da
     database_backup_last_failure: "Database backup failure marker is present.",
     database_backup_missing: "No recent database backup was found.",
     database_backup_stale: "Latest database backup is stale.",
+    host_disk_capacity_low: "Host disk capacity is critically low.",
   };
   return {
     code: warning.code,

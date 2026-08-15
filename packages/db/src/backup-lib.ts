@@ -9,6 +9,8 @@ import postgres from "postgres";
 
 export type BackupRetentionPolicy = {
   dailyDays: number;
+  /** Maximum restore points retained per local calendar day in the daily tier. */
+  dailyBackupsPerDay?: number;
   weeklyWeeks: number;
   monthlyMonths: number;
 };
@@ -115,12 +117,12 @@ function monthlyRetentionCutoff(nowMs: number, monthlyMonths: number): number {
 
 /**
  * Tiered backup pruning:
- * - Daily tier: keep ALL backups from the last `dailyDays` days
+ * - Daily tier: keep the NEWEST `dailyBackupsPerDay` backups per local calendar day
  * - Weekly tier: keep the NEWEST backup per calendar week for `weeklyWeeks` weeks
  * - Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
  * - Everything else is deleted
  */
-function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
+export function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
   if (!existsSync(backupDir)) return 0;
 
   const now = Date.now();
@@ -144,13 +146,25 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
 
   const keepWeekBuckets = new Set<string>();
   const keepMonthBuckets = new Set<string>();
+  const keepDayBucketCounts = new Map<string, number>();
+  const dailyBackupsPerDay = Math.max(1, retention.dailyBackupsPerDay ?? 1);
   const toDelete: string[] = [];
 
   for (const entry of entries) {
-    // Daily tier — keep everything within dailyDays
-    if (entry.mtimeMs >= dailyCutoff) continue;
-
     const date = new Date(entry.mtimeMs);
+
+    // Daily tier — newest-first ordering makes the per-day cap deterministic.
+    if (entry.mtimeMs >= dailyCutoff) {
+      const day = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+      const retainedForDay = keepDayBucketCounts.get(day) ?? 0;
+      if (retainedForDay < dailyBackupsPerDay) {
+        keepDayBucketCounts.set(day, retainedForDay + 1);
+      } else {
+        toDelete.push(entry.fullPath);
+      }
+      continue;
+    }
+
     const week = isoWeekKey(date);
     const month = monthKey(date);
 

@@ -55,7 +55,9 @@ function createApp(
       authReady: true,
       companyDeletionEnabled: true,
       serverInfo,
-      databaseBackupHealth,
+      databaseBackupHealth: databaseBackupHealth
+        ? { minimumFreeBytes: 0, minimumFreePercent: 0, ...databaseBackupHealth }
+        : undefined,
       runtimeEnv,
     }),
   );
@@ -311,6 +313,8 @@ describe("GET /health", () => {
           enabled: true,
           backupDir,
           maxAgeHours: 26,
+          minimumFreeBytes: 0,
+          minimumFreePercent: 0,
           now: new Date("2026-07-06T13:00:00.000Z"),
         },
       }),
@@ -343,6 +347,39 @@ describe("GET /health", () => {
         },
       ],
     });
+  });
+
+  it("reports critically low host capacity as a dedicated health finding", async () => {
+    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-capacity-"));
+    const backupPath = path.join(backupDir, "paperclip-20260815-180000.sql.gz");
+    fs.writeFileSync(backupPath, "backup");
+    fs.utimesSync(backupPath, new Date("2026-08-15T18:00:00.000Z"), new Date("2026-08-15T18:00:00.000Z"));
+
+    try {
+      const app = createApp(createHealthyDb(), testServerInfo, {
+        enabled: true,
+        backupDir,
+        maxAgeHours: 26,
+        minimumFreeBytes: Number.MAX_SAFE_INTEGER,
+        minimumFreePercent: 0,
+        now: new Date("2026-08-15T18:30:00.000Z"),
+      });
+
+      const res = await request(app).get("/health");
+
+      expect(res.status).toBe(200);
+      expect(res.body.databaseBackup.status).toBe("warning");
+      expect(res.body.databaseBackup.hostCapacity).toEqual({
+        totalBytes: expect.any(Number),
+        availableBytes: expect.any(Number),
+        availablePercent: expect.any(Number),
+      });
+      expect(res.body.warnings).toEqual([
+        expect.objectContaining({ code: "host_disk_capacity_low" }),
+      ]);
+    } finally {
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    }
   });
 
   it("redacts detailed metadata for anonymous requests in authenticated mode", async () => {
