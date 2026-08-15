@@ -1520,6 +1520,13 @@
       "when": 1786643974972,
       "tag": "0218_yielding_starbolt",
       "breakpoints": true
+    },
+    {
+      "idx": 219,
+      "version": "7",
+      "when": 1786820237725,
+      "tag": "0219_soft_power_pack",
+      "breakpoints": true
     }
   ]
 }

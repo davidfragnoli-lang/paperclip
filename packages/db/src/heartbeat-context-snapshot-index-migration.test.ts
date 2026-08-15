@@ -25,6 +25,7 @@ d("heartbeat context_snapshot expression index migration", () => {
     const idx = await sql`SELECT indexname FROM pg_indexes WHERE tablename IN ('heartbeat_runs','agent_wakeup_requests')`;
     const names = idx.map((r) => r.indexname as string);
     expect(names).toContain("heartbeat_runs_company_ctx_issue_created_idx");
+    expect(names).toContain("heartbeat_runs_company_ctx_paperclip_issue_idx");
     expect(names).toContain("heartbeat_runs_company_ctx_task_created_idx");
     expect(names).toContain("heartbeat_runs_company_ctx_taskkey_created_idx");
     expect(names).toContain("agent_wakeup_requests_company_payload_issue_idx");
@@ -35,6 +36,17 @@ d("heartbeat context_snapshot expression index migration", () => {
     );
     const planText = plan.map((r) => Object.values(r)[0]).join("\n");
     expect(planText).toContain("heartbeat_runs_company_ctx_issue_created_idx");
+
+    const redactionPlan = await sql.unsafe(
+      "EXPLAIN SELECT context_snapshot FROM heartbeat_runs WHERE company_id = '00000000-0000-0000-0000-000000000001' AND (context_snapshot ->> 'issueId' = 'x' OR context_snapshot -> 'paperclipIssue' ->> 'id' = 'x')",
+    );
+    const redactionPlanText = redactionPlan.map((r) => Object.values(r)[0]).join("\n");
+    // On an empty test table PostgreSQL may use either company-prefixed index
+    // and filter the other OR branch instead of choosing BitmapOr. The branch-1
+    // assertion above plus this branch-2 assertion prove both expressions are
+    // covered while keeping the production predicate free of a sequential scan.
+    expect(redactionPlanText).toContain("heartbeat_runs_company_ctx_paperclip_issue_idx");
+    expect(redactionPlanText).not.toContain("Seq Scan on heartbeat_runs");
 
     const taskPlan = await sql.unsafe(
       "EXPLAIN SELECT id FROM heartbeat_runs WHERE company_id = '00000000-0000-0000-0000-000000000001' AND context_snapshot ->> 'taskId' = 'x' ORDER BY created_at DESC, id DESC LIMIT 1",
@@ -63,6 +75,7 @@ d("heartbeat context_snapshot expression index migration", () => {
     for (const migration of [
       "./migrations/0210_heartbeat_context_snapshot_indexes.sql",
       "./migrations/0211_heartbeat_context_taskkey_index.sql",
+      "./migrations/0219_soft_power_pack.sql",
     ]) {
       const migrationSql = await readFile(
         fileURLToPath(new URL(migration, import.meta.url)),
