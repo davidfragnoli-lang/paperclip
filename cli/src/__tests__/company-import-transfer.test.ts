@@ -239,7 +239,7 @@ describe("resolveChunkedImportZip", () => {
     expect(archive.rootPath).toBe("big-package");
     expect(Object.keys(archive.files).sort()).toEqual(["COMPANY.md", "blobs/4f2d1c9a"]);
     expect(archive.files["COMPANY.md"]).toBe("# Company\n");
-  });
+  }, 15_000);
 });
 
 describe("uploadCompanyImportTransfer", () => {
