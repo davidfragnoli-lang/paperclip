@@ -1101,6 +1101,11 @@ async function statPath(targetPath: string) {
   return fs.stat(targetPath).catch(() => null);
 }
 
+async function hasExactSkillMarkdown(directoryPath: string) {
+  const entries = await fs.readdir(directoryPath, { withFileTypes: true }).catch(() => []);
+  return entries.some((entry) => entry.name === "SKILL.md" && entry.isFile());
+}
+
 function pathIsContained(rootPath: string, candidatePath: string) {
   const relativePath = path.relative(rootPath, candidatePath);
   return relativePath === ""
@@ -1423,8 +1428,9 @@ export async function discoverProjectWorkspaceSkillDirectories(
     relativePath: string;
     inventoryMode: LocalSkillInventoryMode;
   }>();
-  const workspaceRoot = await fs.realpath(path.resolve(target.workspaceCwd)).catch(() => null);
-  if (!workspaceRoot) return [];
+  const workspaceRoot = path.resolve(target.workspaceCwd);
+  const canonicalWorkspaceRoot = await fs.realpath(workspaceRoot).catch(() => null);
+  if (!canonicalWorkspaceRoot) return [];
   const rootSkillPath = path.join(workspaceRoot, "SKILL.md");
   if ((await statPath(rootSkillPath))?.isFile()) {
     discovered.set(workspaceRoot, {
@@ -1440,9 +1446,10 @@ export async function discoverProjectWorkspaceSkillDirectories(
       : explicitPath.toLowerCase() === "skill.md"
         ? "."
         : explicitPath;
-    const absoluteSkillDir = await fs.realpath(path.resolve(workspaceRoot, relativeSkillDir)).catch(() => null);
-    if (!absoluteSkillDir) continue;
-    const relativeToWorkspace = path.relative(workspaceRoot, absoluteSkillDir);
+    const absoluteSkillDir = path.resolve(workspaceRoot, relativeSkillDir);
+    const canonicalSkillDir = await fs.realpath(absoluteSkillDir).catch(() => null);
+    if (!canonicalSkillDir) continue;
+    const relativeToWorkspace = path.relative(canonicalWorkspaceRoot, canonicalSkillDir);
     if (
       relativeToWorkspace === ".."
       || relativeToWorkspace.startsWith(`..${path.sep}`)
@@ -4852,7 +4859,7 @@ export function companySkillService(db: Db) {
         path: entryPath,
         kind: entry.isDirectory() ? "directory" : "file",
         isSkill: entry.isDirectory()
-          ? Boolean((await statPath(path.join(targetPath, entry.name, "SKILL.md")))?.isFile())
+          ? await hasExactSkillMarkdown(path.join(targetPath, entry.name))
           : entry.name === "SKILL.md",
       });
     }

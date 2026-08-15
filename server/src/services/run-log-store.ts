@@ -56,6 +56,14 @@ function resolveWithin(basePath: string, relativePath: string) {
   return resolved;
 }
 
+function resolveRunLogBasePath() {
+  return process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
+}
+
+export function resolveLocalRunLogPath(logRef: string) {
+  return resolveWithin(resolveRunLogBasePath(), logRef);
+}
+
 function normalizeKeyPrefix(prefix: string | undefined): string {
   if (!prefix) return "";
   return prefix.trim().replace(/^\/+/, "").replace(/\/+$/, "");
@@ -415,7 +423,7 @@ let cachedStore: RunLogStore | null = null;
 
 export function getRunLogStore() {
   if (cachedStore) return cachedStore;
-  const basePath = process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
+  const basePath = resolveRunLogBasePath();
   cachedStore = createDurableRunLogStore({ basePath, s3: resolveRunLogS3() });
   return cachedStore;
 }

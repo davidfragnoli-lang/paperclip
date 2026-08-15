@@ -77,6 +77,15 @@ test("a route/authz suite never leaks into the general-server shards", () => {
   }
 });
 
+test("the unsharded general-server lane uses bounded explicit allowlist shards", () => {
+  const dryRun = dryRunJson(["--mode", "general", "--group", "general-server"]);
+  assert.equal(
+    dryRun.localGeneralServerShardCount,
+    SHARD_COUNT,
+    "the full local lane must run the explicit general-server allowlist in bounded shards",
+  );
+});
+
 test("shard flags are rejected for the workspaces-b group", () => {
   const result = dryRun(["--mode", "general", "--group", "general-workspaces-b", "--shard-index", "0", "--shard-count", "3"]);
   assert.notEqual(result.status, 0, "workspaces-b must not accept shard flags");

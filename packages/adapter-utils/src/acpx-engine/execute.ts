@@ -80,6 +80,7 @@ import {
   DEFAULT_ACP_ENGINE_MODE,
   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
   DEFAULT_ACP_ENGINE_PERMISSION_MODE,
+  DEFAULT_ACP_ENGINE_STREAM_IDLE_TIMEOUT_MS,
   DEFAULT_ACP_ENGINE_TIMEOUT_SEC,
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "./constants.js";
@@ -2260,8 +2261,9 @@ function renderApiAccessNote(env: Record<string, string>): string {
     "Use terminal commands with curl to make Paperclip API requests.",
     "Normalize the base URL before adding API paths:",
     `  PAPERCLIP_API_BASE="\${PAPERCLIP_API_URL%/}"; PAPERCLIP_API_BASE="\${PAPERCLIP_API_BASE%/api}"`,
+    "Do not follow redirects. Treat the request as successful only when it returns HTTP 200 with content-type application/json; an HTTP 200 text/html response is an access login page, not the API.",
     "GET example:",
-    `  curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "$PAPERCLIP_API_BASE/api/agents/me"`,
+    `  curl -sS -D - -H "Authorization: Bearer $PAPERCLIP_API_KEY" "$PAPERCLIP_API_BASE/api/agents/me"`,
   ];
   if (env.PAPERCLIP_TASK_ID) {
     lines.push(
@@ -2463,6 +2465,21 @@ function usdCostAmount(cost: AcpRuntimeUsageCost | null | undefined): number | n
   if (!cost || typeof cost.amount !== "number" || !Number.isFinite(cost.amount)) return null;
   if (cost.currency && cost.currency.trim().toUpperCase() !== "USD") return null;
   return cost.amount;
+}
+
+function normalizeStreamIdleTimeoutMs(config: Record<string, unknown>): number {
+  const value = asNumber(
+    config.streamIdleTimeoutMs ?? config.acpStreamIdleTimeoutMs,
+    DEFAULT_ACP_ENGINE_STREAM_IDLE_TIMEOUT_MS,
+  );
+  return value > 0 ? value : 0;
+}
+
+function formatAcpxStreamIdleTimeoutErrorMessage(elapsedMs: number): string {
+  const totalSeconds = Math.max(0, Math.round(elapsedMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds - minutes * 60;
+  return `monitor: no ACP stream event for ${minutes}m ${seconds}s`;
 }
 
 async function readRuntimeStatus(
@@ -2900,8 +2917,6 @@ function warmHandleMatches(
   return entry !== undefined && entry.runtime === runtime && entry.handle === handle;
 }
 
-/** The stable name of the one root span for a sandbox bring-up. It is a fixed
- * low-cardinality constant, never derived from run/user data. */
 const STARTUP_ROOT_SPAN_NAME = "sandbox.startup";
 
 /** The shared batch tag for the two parallel bridge steps. It is a fixed
@@ -2964,7 +2979,7 @@ function openStartupRootSpan(
         if (failed) span.setStatus({ code: 2 });
         span.end();
       } catch {
-        // Observability must not change startup control flow.
+        // Startup telemetry must never change runtime control flow.
       }
     },
   };
@@ -3566,7 +3581,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       let cancelActiveTurn: ((reason: string) => Promise<void>) | null = null;
       let controller: AbortController | null = null;
       let timeout: NodeJS.Timeout | null = null;
+      let streamIdleTimer: NodeJS.Timeout | null = null;
       let timedOut = false;
+      let streamIdleTimedOut = false;
+      let streamIdleLastEventAt = now();
+      let streamIdleMessage: string | null = null;
+      const streamIdleTimeoutMs = normalizeStreamIdleTimeoutMs(ctx.config);
       const textParts: string[] = [];
       let eventBreakdown: AcpRuntimeUsageBreakdown | null = null;
       let eventCostUsd: number | null = null;
@@ -3587,6 +3607,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         controller = new AbortController();
         if (timeoutMs) {
           timeout = setTimeout(() => {
+            if (streamIdleTimedOut) return;
             timedOut = true;
             controller?.abort();
             void cancelActiveTurn?.(formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)).catch(() => {});
@@ -3603,8 +3624,30 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         cancelActiveTurn = async (reason: string) => {
           await turn.cancel({ reason });
         };
+        const stopStreamIdleTimer = () => {
+          if (!streamIdleTimer) return;
+          clearTimeout(streamIdleTimer);
+          streamIdleTimer = null;
+        };
+        const armStreamIdleTimer = () => {
+          stopStreamIdleTimer();
+          if (!(streamIdleTimeoutMs > 0)) return;
+          streamIdleTimer = setTimeout(() => {
+            if (timedOut) return;
+            streamIdleTimedOut = true;
+            streamIdleMessage = formatAcpxStreamIdleTimeoutErrorMessage(
+              Math.max(0, now() - streamIdleLastEventAt),
+            );
+            controller?.abort();
+            void cancelActiveTurn?.(streamIdleMessage).catch(() => {});
+          }, streamIdleTimeoutMs);
+          streamIdleTimer.unref?.();
+        };
+        armStreamIdleTimer();
         const toolTitles = new Map<string, string>();
         for await (const event of turn.events) {
+          streamIdleLastEventAt = now();
+          armStreamIdleTimer();
           if (event.type === "text_delta") textParts.push(event.text);
           if (event.type === "status" && event.tag === "usage_update") {
             eventBreakdown = event.breakdown ?? eventBreakdown;
@@ -3614,6 +3657,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         }
         const terminal = await turn.result;
         if (timeout) clearTimeout(timeout);
+        stopStreamIdleTimer();
         // Read usage before the close/warm-handle paths below can discard state.
         const postTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
         const turnUsage = summarizeAcpxTurnUsage({
@@ -3622,21 +3666,29 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           eventBreakdown,
           eventCostUsd,
         });
-        if (terminal.status === "failed" || terminal.status === "cancelled" || timedOut) {
+        if (terminal.status === "failed" || terminal.status === "cancelled" || timedOut || streamIdleTimedOut) {
           const existing = warmHandles.get(prepared.sessionKey);
           if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
             await closeWarmHandle({
               handles: warmHandles,
               key: prepared.sessionKey,
               entry: existing,
-              reason: timedOut ? "paperclip timeout cleanup" : `paperclip turn ${terminal.status}`,
-              discardPersistentState: terminal.status === "cancelled" || timedOut,
+              reason: streamIdleTimedOut
+                ? "paperclip stream idle timeout cleanup"
+                : timedOut
+                  ? "paperclip timeout cleanup"
+                  : `paperclip turn ${terminal.status}`,
+              discardPersistentState: terminal.status === "cancelled" || timedOut || streamIdleTimedOut,
             });
           } else {
             await runtime.close({
               handle: sessionHandle,
-              reason: timedOut ? "paperclip timeout cleanup" : `paperclip turn ${terminal.status}`,
-              discardPersistentState: terminal.status === "cancelled" || timedOut,
+              reason: streamIdleTimedOut
+                ? "paperclip stream idle timeout cleanup"
+                : timedOut
+                  ? "paperclip timeout cleanup"
+                  : `paperclip turn ${terminal.status}`,
+              discardPersistentState: terminal.status === "cancelled" || timedOut || streamIdleTimedOut,
             }).catch(() => {});
           }
         } else if (prepared.mode === "persistent" && warmIdleMs > 0 && !prepared.processSessionBridge) {
@@ -3688,15 +3740,17 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // next run stages fresh instead of reusing a torn-down session's staged
         // credentials. Copy-back still fires for every outcome via
         // `cleanupRemoteBridges` below (unchanged from PR 2).
-        if (terminal.status === "completed" && !timedOut) {
+        if (terminal.status === "completed" && !timedOut && !streamIdleTimedOut) {
           saveStagedRuntimeAfterCleanTurn({ handles: stagedRuntimes, prepared, now: now() });
         } else {
           await discardStagedRuntime({ handles: stagedRuntimes, prepared });
         }
 
-        const errorMessage = timedOut
-          ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
-          : resultErrorMessage(terminal);
+        const errorMessage = streamIdleTimedOut
+          ? streamIdleMessage ?? formatAcpxStreamIdleTimeoutErrorMessage(streamIdleTimeoutMs)
+          : timedOut
+            ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
+            : resultErrorMessage(terminal);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
         await emitAcpxLog(ctx, {
           type: terminal.status === "completed" ? "acpx.result" : "acpx.error",
@@ -3708,13 +3762,19 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         flushChildStderr(childStderrState);
         // The one clean-completion path clears the run failure flag; every other
         // path keeps it set, so the run root span closes with error status.
-        runFailed = terminal.status === "completed" && !timedOut ? false : true;
+        runFailed = terminal.status === "completed" && !timedOut && !streamIdleTimedOut ? false : true;
         return {
           exitCode: terminal.status === "completed" ? 0 : 1,
           signal: timedOut ? "SIGTERM" : null,
-          timedOut,
+          timedOut: timedOut && !streamIdleTimedOut,
           errorMessage,
-          errorCode: terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null,
+          errorCode: streamIdleTimedOut
+            ? "acpx_stream_idle_timeout"
+            : terminal.status === "failed"
+              ? "acpx_turn_failed"
+              : timedOut
+                ? "acpx_timeout"
+                : null,
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
           sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
           sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -3731,27 +3791,42 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             requestedModel: prepared.requestedModel || null,
             requestedThinkingEffort: prepared.requestedThinkingEffort || null,
             fastMode: prepared.fastMode,
+            ...(streamIdleTimedOut
+              ? {
+                  streamIdleTimeout: {
+                    timeoutMs: streamIdleTimeoutMs,
+                    lastStreamEventAt: new Date(streamIdleLastEventAt).toISOString(),
+                  },
+                }
+              : {}),
             ...(turnUsage.usageDetail ? { usage: turnUsage.usageDetail } : {}),
             ...(turnUsage.cumulativeCostUsd != null
               ? { cumulativeCostUsd: turnUsage.cumulativeCostUsd }
               : {}),
           },
           summary: textParts.join("").trim() || terminalStopReason || terminal.status,
-          clearSession,
+          clearSession: clearSession || streamIdleTimedOut,
         };
       } catch (err) {
         if (timeout) clearTimeout(timeout);
-        const messageOverride = timedOut
-          ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
-          : undefined;
+        if (streamIdleTimer) clearTimeout(streamIdleTimer);
+        const messageOverride = streamIdleTimedOut
+          ? streamIdleMessage ?? formatAcpxStreamIdleTimeoutErrorMessage(streamIdleTimeoutMs)
+          : timedOut
+            ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
+            : undefined;
         const cancel = cancelActiveTurn as ((reason: string) => Promise<void>) | null;
         const preEmitMessage =
           messageOverride ?? (err instanceof Error ? err.message : String(err));
         if (cancel) await cancel(preEmitMessage).catch(() => {});
         await runtime.close({
           handle: sessionHandle,
-          reason: timedOut ? "paperclip timeout cleanup" : "paperclip error cleanup",
-          discardPersistentState: timedOut,
+          reason: streamIdleTimedOut
+            ? "paperclip stream idle timeout cleanup"
+            : timedOut
+              ? "paperclip timeout cleanup"
+              : "paperclip error cleanup",
+          discardPersistentState: timedOut || streamIdleTimedOut,
         }).catch(() => {});
         const existing = warmHandles.get(prepared.sessionKey);
         if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
@@ -3771,15 +3846,29 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         return {
           exitCode: 1,
           signal: timedOut ? "SIGTERM" : null,
-          timedOut,
+          timedOut: timedOut && !streamIdleTimedOut,
           errorMessage: message,
-          errorCode: timedOut ? "acpx_timeout" : classified.errorCode,
+          errorCode: streamIdleTimedOut
+            ? "acpx_stream_idle_timeout"
+            : timedOut
+              ? "acpx_timeout"
+              : classified.errorCode,
           errorMeta: classified.errorMeta,
           ...billingFields,
           ...referencedProjectStagingFailuresField,
           model: prepared.requestedModel || null,
-          clearSession: clearSession || timedOut,
-          resultJson: { phase: "turn" },
+          clearSession: clearSession || timedOut || streamIdleTimedOut,
+          resultJson: {
+            phase: "turn",
+            ...(streamIdleTimedOut
+              ? {
+                  streamIdleTimeout: {
+                    timeoutMs: streamIdleTimeoutMs,
+                    lastStreamEventAt: new Date(streamIdleLastEventAt).toISOString(),
+                  },
+                }
+              : {}),
+          },
           summary: message,
         };
       } finally {

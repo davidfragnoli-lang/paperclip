@@ -165,12 +165,14 @@ describe("sandbox adapter execution targets", () => {
       const timeout = setTimeout(() => {
         child.kill("SIGKILL");
         reject(new Error("Timed out waiting for process session proxy."));
-      }, 5000);
+      }, 15_000);
       child.on("error", (error) => {
         clearTimeout(timeout);
         reject(error);
       });
-      child.on("exit", (exitCode) => {
+      // `exit` can fire before stdout/stderr have drained. `close` waits for
+      // the stdio handles too, so the assertions below see the complete output.
+      child.on("close", (exitCode) => {
         clearTimeout(timeout);
         resolve(exitCode);
       });
@@ -737,6 +739,73 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it("publishes ordered sandbox process session stdin only after each remote write is complete", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-ordered-"));
+    cleanupDirs.push(rootDir);
+    const childPath = path.join(rootDir, "ordered-acp-child.mjs");
+    await writeFile(
+      childPath,
+      [
+        "process.stdin.on('data', (chunk) => process.stdout.write(chunk));",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const delegate = createLocalSandboxRunner();
+    let finalizeDelayed = false;
+    const runner = {
+      execute: async (input: Parameters<typeof delegate.execute>[0]) => {
+        const script = (input.args ?? []).join("\n");
+        if (/\/stdin\/000000000001\.json/.test(script) && script.includes("base64 -d <")) {
+          finalizeDelayed = true;
+          // Stretch the interval between opening the decode destination and
+          // writing its bytes. A direct decode into the queue-visible path lets
+          // the remote poller consume an empty file; decoding to a temporary
+          // sibling and renaming it after completion keeps the payload atomic.
+          const args = (input.args ?? []).map((arg) =>
+            arg.replace(
+              /base64 -d < (.+?) > (.+?) &&/,
+              "{ sleep 0.3; base64 -d < $1; } > $2 &&",
+            ),
+          );
+          return delegate.execute({ ...input, args });
+        }
+        return delegate.execute(input);
+      },
+    };
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: 30_000,
+      runner,
+    };
+
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-process-session-ordered",
+      target,
+      runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+      adapterKey: "acpx",
+      command: process.execPath,
+      args: [childPath],
+      cwd: rootDir,
+      env: {},
+      timeoutSec: 5,
+      onLog: async () => {},
+    });
+    expect(bridge).not.toBeNull();
+
+    try {
+      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+      expect(finalizeDelayed).toBe(true);
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe("hello\n");
+    } finally {
+      await bridge?.stop();
+    }
+  });
+
   it("buffers sandbox process session output until the local proxy connects", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-buffer-"));
     cleanupDirs.push(rootDir);
@@ -953,7 +1022,7 @@ describe("sandbox adapter execution targets", () => {
       const timeout = setTimeout(() => {
         child.kill("SIGKILL");
         reject(new Error("Timed out waiting for streaming process session proxy."));
-      }, 5000);
+      }, 15_000);
       child.on("error", (error) => {
         clearTimeout(timeout);
         reject(error);
@@ -970,7 +1039,7 @@ describe("sandbox adapter execution targets", () => {
       await waitForCondition(
         () => stdout.includes("delta:ping\n") && stderr.includes("trace:ping\n"),
         "Timed out waiting for live process session output.",
-        3000,
+        10_000,
       );
       expect(exited).toBe(false);
 

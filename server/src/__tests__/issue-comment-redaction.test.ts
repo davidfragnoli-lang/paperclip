@@ -148,6 +148,20 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
     expect(exactComment?.body).toBe("");
     expect(exactComment?.metadata).toBeNull();
 
+    const commentsResponse = await request(createApp(companyId))
+      .get(`/api/issues/${issueId}/comments`)
+      .query({ order: "asc" });
+    expect(commentsResponse.status, JSON.stringify(commentsResponse.body)).toBe(200);
+    expect(commentsResponse.body).toEqual([
+      expect.objectContaining({
+        id: commentId,
+        createdAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+        updatedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+      }),
+    ]);
+    expect(Date.parse(commentsResponse.body[0].createdAt)).not.toBeNaN();
+    expect(Date.parse(commentsResponse.body[0].updatedAt)).not.toBeNaN();
+
     const heartbeatContext = await request(createApp(companyId))
       .get(`/api/issues/${issueId}/heartbeat-context`)
       .query({ wakeCommentId: commentId });

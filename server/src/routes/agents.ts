@@ -137,6 +137,7 @@ import {
 import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { routineService } from "../services/routines.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
@@ -381,6 +382,10 @@ export function agentRoutes(
 
   const runRedactions = createRunSecretRedactionRegistry(db);
   const heartbeat = heartbeatService(db, {
+    pluginWorkerManager: options.pluginWorkerManager,
+  });
+  const routinesSvc = routineService(db, {
+    heartbeat,
     pluginWorkerManager: options.pluginWorkerManager,
   });
   const recovery = recoveryService(db, { enqueueWakeup: heartbeat.wakeup });
@@ -3772,6 +3777,27 @@ export function agentRoutes(
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
+    });
+
+    const catchUpRuns = existing.pausedAt
+      ? await routinesSvc.catchUpPauseRefusedRuns({
+          agentId: agent.id,
+          pausedAt: existing.pausedAt,
+          resumedAt: new Date(),
+        })
+      : [];
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "agent.resume_dispatch_recovery",
+      entityType: "agent",
+      entityId: agent.id,
+      details: {
+        pausedAt: existing.pausedAt?.toISOString() ?? null,
+        recoveredRoutineCount: catchUpRuns.length,
+        recoveredRoutineRuns: catchUpRuns,
+      },
     });
 
     res.json(agent);
