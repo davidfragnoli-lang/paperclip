@@ -4658,9 +4658,35 @@ describe("resolveShell (shell fallback)", () => {
 
 describe("readLocalServicePortOwner", () => {
   const originalPlatform = process.platform;
+  const originalPath = process.env.PATH;
 
   afterEach(() => {
     Object.defineProperty(process, "platform", { value: originalPlatform });
+    process.env.PATH = originalPath;
+  });
+
+  it("uses the macOS system lsof when the agent PATH omits sbin", async () => {
+    if (process.platform !== "darwin") return;
+    try {
+      await fs.access("/usr/sbin/lsof");
+    } catch {
+      return;
+    }
+
+    process.env.PATH = "/usr/local/bin:/usr/bin:/bin";
+    const server = net.createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : null;
+      expect(port).toBeTypeOf("number");
+
+      await expect(readLocalServicePortOwner(port!)).resolves.toBe(process.pid);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+    }
   });
 
   it("detects the owner of a listening TCP port", async () => {

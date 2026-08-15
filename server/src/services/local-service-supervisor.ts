@@ -406,16 +406,20 @@ export async function terminateLocalService(
 
 export async function readLocalServicePortOwner(port: number) {
   if (!Number.isInteger(port) || port <= 0 || process.platform === "win32") return null;
-  try {
-    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
-    const firstPid = stdout
-      .split("\n")
-      .map((line) => Number.parseInt(line.trim(), 10))
-      .find((value) => Number.isInteger(value) && value > 0);
-    return firstPid ?? null;
-  } catch {
-    return null;
+  const executables = process.platform === "darwin" ? ["lsof", "/usr/sbin/lsof"] : ["lsof"];
+  for (const executable of executables) {
+    try {
+      const { stdout } = await execFileAsync(executable, ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
+      const firstPid = stdout
+        .split("\n")
+        .map((line) => Number.parseInt(line.trim(), 10))
+        .find((value) => Number.isInteger(value) && value > 0);
+      return firstPid ?? null;
+    } catch {
+      // macOS installs lsof in /usr/sbin, which is not always present in agent PATHs.
+    }
   }
+  return null;
 }
 
 export async function readLocalServiceProcessCwd(pid: number) {
