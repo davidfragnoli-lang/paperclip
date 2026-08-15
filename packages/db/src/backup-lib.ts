@@ -450,6 +450,8 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
   let bufferedBytes = 0;
   let firstChunk = true;
   let closed = false;
+  let fileClosed = false;
+  let closeSucceeded = false;
   let pendingWrite = Promise.resolve();
 
   const getFile = async () => {
@@ -507,25 +509,35 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       await pendingWrite;
     },
     async close() {
-      if (closed) return;
+      if (closed && fileClosed) return;
       closed = true;
       flushBufferedLines();
-      await pendingWrite;
-      if (filePromise) {
-        const file = await getFile();
-        await file.close();
-        fileHandle = null;
+      try {
+        await pendingWrite;
+      } finally {
+        if (filePromise && !fileClosed) {
+          const file = await getFile();
+          await file.close();
+          fileClosed = true;
+          fileHandle = null;
+        }
       }
+      closeSucceeded = true;
     },
     async abort() {
-      if (closed) return;
+      if (closeSucceeded) return;
       closed = true;
       bufferedLines = [];
       bufferedBytes = 0;
       await pendingWrite.catch(() => {});
-      if (filePromise) {
-        await getFile().then((file) => file.close()).catch(() => {});
-        fileHandle = null;
+      if (filePromise && !fileClosed) {
+        await getFile()
+          .then(async (file) => {
+            await file.close();
+            fileClosed = true;
+            fileHandle = null;
+          })
+          .catch(() => {});
       }
       if (existsSync(filePath)) {
         try {

@@ -1,8 +1,9 @@
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { gunzipSync } from "node:zlib";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
@@ -81,6 +82,36 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+
+  it("cleans up the partial file when closing fails", async () => {
+    const tempDir = createTempDir("paperclip-buffered-writer-close-failure-");
+    const outputPath = path.join(tempDir, "backup.sql");
+    const originalOpen = fs.promises.open;
+    const openedHandles: fs.promises.FileHandle[] = [];
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (filePath, flags, mode) => {
+      const handle = await originalOpen(filePath, flags, mode);
+      openedHandles.push(handle);
+      return handle;
+    });
+    syncBuiltinESMExports();
+    const writer = createBufferedTextFileWriter(outputPath, 1);
+    writer.emit("partial backup");
+    await writer.drain();
+
+    try {
+      const openedHandle = openedHandles[0];
+      expect(openedHandle).toBeDefined();
+      await openedHandle!.close();
+      writer.emit("write after external close");
+      await expect(writer.close()).rejects.toThrow();
+      await writer.abort();
+      expect(fs.existsSync(outputPath)).toBe(false);
+    } finally {
+      openSpy.mockRestore();
+      syncBuiltinESMExports();
+      await Promise.all(openedHandles.map((handle) => handle.close().catch(() => {})));
+    }
   });
 });
 
