@@ -4393,6 +4393,121 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("excludes backlog children from implicit blocker attention while preserving real and explicit blockers", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const backlogOnlyParentId = randomUUID();
+    const activeChildrenParentId = randomUUID();
+    const explicitBacklogParentId = randomUUID();
+    const explicitBacklogIssueId = randomUUID();
+    const linkedBacklogChildParentId = randomUUID();
+    const linkedBacklogChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: backlogOnlyParentId,
+        companyId,
+        identifier: "PAP-16000",
+        title: "Parent with deferred child",
+        status: "blocked",
+        priority: "medium",
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        parentId: backlogOnlyParentId,
+        identifier: "PAP-16001",
+        title: "Deferred child",
+        status: "backlog",
+        priority: "medium",
+      },
+      {
+        id: activeChildrenParentId,
+        companyId,
+        identifier: "PAP-16002",
+        title: "Parent with active children",
+        status: "blocked",
+        priority: "medium",
+      },
+      ...(["todo", "in_progress", "in_review", "blocked"] as const).map((status, index) => ({
+        id: randomUUID(),
+        companyId,
+        parentId: activeChildrenParentId,
+        identifier: `PAP-${16003 + index}`,
+        title: `${status} child`,
+        status,
+        priority: "medium" as const,
+      })),
+      {
+        id: explicitBacklogParentId,
+        companyId,
+        identifier: "PAP-16007",
+        title: "Parent with explicit deferred dependency",
+        status: "blocked",
+        priority: "medium",
+      },
+      {
+        id: explicitBacklogIssueId,
+        companyId,
+        identifier: "PAP-16008",
+        title: "Explicit deferred dependency",
+        status: "backlog",
+        priority: "medium",
+      },
+      {
+        id: linkedBacklogChildParentId,
+        companyId,
+        identifier: "PAP-16009",
+        title: "Parent with linked deferred child",
+        status: "blocked",
+        priority: "medium",
+      },
+      {
+        id: linkedBacklogChildId,
+        companyId,
+        parentId: linkedBacklogChildParentId,
+        identifier: "PAP-16010",
+        title: "Deferred child with explicit dependency edge",
+        status: "backlog",
+        priority: "medium",
+      },
+    ]);
+
+    await svc.update(explicitBacklogParentId, { blockedByIssueIds: [explicitBacklogIssueId] });
+    await svc.update(linkedBacklogChildParentId, { blockedByIssueIds: [linkedBacklogChildId] });
+
+    const byId = new Map(
+      (await svc.list(companyId, { status: "blocked" })).map((issue) => [issue.id, issue]),
+    );
+
+    expect(byId.get(backlogOnlyParentId)?.blockerAttention).toMatchObject({
+      unresolvedBlockerCount: 0,
+      sampleBlockerIdentifier: null,
+    });
+    expect(byId.get(activeChildrenParentId)?.blockerAttention).toMatchObject({
+      unresolvedBlockerCount: 4,
+    });
+    expect(byId.get(explicitBacklogParentId)?.blockerAttention).toMatchObject({
+      unresolvedBlockerCount: 1,
+      sampleBlockerIdentifier: "PAP-16008",
+    });
+    expect(byId.get(linkedBacklogChildParentId)?.blockerAttention).toMatchObject({
+      unresolvedBlockerCount: 1,
+      sampleBlockerIdentifier: "PAP-16010",
+    });
+    await expect(svc.getRelationSummaries(explicitBacklogParentId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: explicitBacklogIssueId, status: "backlog" })],
+    });
+    await expect(svc.getRelationSummaries(linkedBacklogChildParentId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: linkedBacklogChildId, status: "backlog" })],
+    });
+  });
+
   it("unblocks a source issue when a liveness escalation recovery issue is marked done", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
