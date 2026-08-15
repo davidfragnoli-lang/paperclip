@@ -31,6 +31,7 @@ import type {
   AcpxRemoteManagedHomeResult,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
 import {
+  asBoolean,
   asNumber,
   asString,
   parseObject,
@@ -158,9 +159,18 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
   const normalizedModel = normalizeCodexModel(
     typeof config.model === "string" ? config.model : "",
   );
+  const bypassApprovalsAndSandbox = asBoolean(
+    config.dangerouslyBypassApprovalsAndSandbox,
+    asBoolean(config.dangerouslyBypassSandbox, false),
+  );
+  const configuredEnv = parseObject(config.env);
+  const env = bypassApprovalsAndSandbox && typeof configuredEnv.INITIAL_AGENT_MODE !== "string"
+    ? { ...configuredEnv, INITIAL_AGENT_MODE: "agent-full-access" }
+    : configuredEnv;
 
   return {
     ...config,
+    env,
     agent: "codex",
     mode,
     permissionMode,
