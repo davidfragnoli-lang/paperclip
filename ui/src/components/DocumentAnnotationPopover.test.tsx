@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { createRef } from "react";
+import { act, createRef } from "react";
 import { createRoot } from "react-dom/client";
 import type { DocumentAnnotationThreadWithComments } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -88,7 +88,9 @@ describe("DocumentAnnotationPopover", () => {
       ...overrides,
     };
     props.containerRef.current = container;
-    root.render(<DocumentAnnotationPopover {...props} />);
+    await act(async () => {
+      root.render(<DocumentAnnotationPopover {...props} />);
+    });
     await vi.waitFor(() => expect(container.querySelector('[data-testid="document-annotation-popover"]')).not.toBeNull());
     return { onClose };
   };
