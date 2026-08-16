@@ -168,6 +168,7 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     document.body.innerHTML = "";
     vi.clearAllMocks();
   });
@@ -343,11 +344,10 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
     const deny = () => {
       throw new DOMException("The operation is insecure.", "SecurityError");
     };
-    const getItem = vi.spyOn(window.localStorage, "getItem").mockImplementation(deny);
-    const removeItem = vi
-      .spyOn(window.localStorage, "removeItem")
-      .mockImplementation(deny);
-    const setItem = vi.spyOn(window.localStorage, "setItem").mockImplementation(deny);
+    const getItem = vi.fn(deny);
+    const removeItem = vi.fn(deny);
+    const setItem = vi.fn(deny);
+    vi.stubGlobal("localStorage", { getItem, removeItem, setItem });
     mockCompany.companies = [{ id: "c1", name: "My Co", issuePrefix: "MC" }];
     mockCompany.loading = false;
 
@@ -366,9 +366,7 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
     // throwing on the way in.
     expect(document.body.textContent).not.toBe("");
 
-    getItem.mockRestore();
-    removeItem.mockRestore();
-    setItem.mockRestore();
+    vi.unstubAllGlobals();
     await act(async () => {
       root.unmount();
     });

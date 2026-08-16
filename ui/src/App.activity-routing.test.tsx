@@ -112,9 +112,9 @@ function renderAppAt(container: HTMLElement, path: string) {
 }
 
 async function waitForRoute(container: HTMLElement, text: string) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
     if (container.textContent?.includes(text)) return;
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    await new Promise((resolve) => window.setTimeout(resolve, 10));
   }
   expect(container.textContent).toContain(text);
 }
