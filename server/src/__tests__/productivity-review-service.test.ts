@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -208,6 +208,78 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  it("does not create an ownerless review when every owner candidate is uninvokable", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, seeded.managerId));
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+
+    const result = await productivityReviewService(db, { enqueueWakeup }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.ownerUnresolved).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("repairs an open ownerless review and wakes the resolved owner exactly once", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Ownerless productivity review",
+      status: "todo",
+      priority: "high",
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: seeded.createdAt,
+      updatedAt: seeded.createdAt,
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+
+    const result = await productivityReviewService(db, { enqueueWakeup }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+    const secondResult = await productivityReviewService(db, { enqueueWakeup }).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(result.ownerRepaired).toBe(1);
+    expect(secondResult.ownerRepaired).toBe(0);
+    expect(review?.assigneeAgentId).toBe(seeded.managerId);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      seeded.managerId,
+      expect.objectContaining({ reason: "issue_assigned" }),
+    );
   });
 
   it("refreshes open productivity reviews only once per interval and caps refresh comments", async () => {
