@@ -15003,6 +15003,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
+
+    // Retry stranded pending_cleanup leases on the same tick. Isolate the sweep
+    // so its failure never hides the reaper result. The backoff equals the
+    // reaper staleness threshold.
+    try {
+      const sweep = await sweepPendingCleanupLeases({ backoffMs: staleThresholdMs });
+      if (sweep.destroyed > 0 || sweep.capped > 0) {
+        logger.warn(
+          { destroyed: sweep.destroyed, capped: sweep.capped, swept: sweep.swept },
+          "swept pending_cleanup environment leases",
+        );
+      }
+    } catch {
+      // Log a constant errorKind only. The exception can carry a credential in
+      // its name, code, message, cause, or stack, so the sweep never reads it.
+      logger.error(
+        { errorKind: PENDING_CLEANUP_SWEEP_ERROR_KIND },
+        "pending_cleanup lease sweep failed",
+      );
+    }
+
     return { reaped: reaped.length, runIds: reaped };
   }
 
