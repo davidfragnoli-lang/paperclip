@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { WebSocketServer } from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -293,6 +293,116 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
     expect(runs[0]?.id).toBe(runId);
+  });
+
+  it("treats a deferred wake insert conflict as an existing wake", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const idempotencyKey = `deferred-conflict:${issueId}`;
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CEO",
+      role: "ceo",
+      status: "running",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_assigned",
+      },
+    });
+    runningProcesses.set(runId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Resume after current execution",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+      executionAgentNameKey: "ceo",
+      executionLockedAt: new Date(),
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    const existingWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: existingWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "existing_live_wake",
+      payload: { issueId: randomUUID() },
+      status: "queued",
+      idempotencyKey,
+    });
+
+    const followupRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "approval_approved",
+      payload: { issueId, approvalId: "approval-1" },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        approvalId: "approval-1",
+        approvalStatus: "approved",
+        wakeReason: "approval_approved",
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+      idempotencyKey,
+    });
+
+    expect(followupRun).toBeNull();
+
+    const liveWakeups = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          inArray(agentWakeupRequests.status, ["queued", "claimed", "completed", "deferred_issue_execution"]),
+        ),
+      );
+
+    expect(liveWakeups).toEqual([{ id: existingWakeId, status: "queued" }]);
   });
 
   it("defers recovery hand-back wakes until the resolving run exits", async () => {
@@ -2181,4 +2291,140 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       await gateway.close();
     }
   }, 20_000);
+
+  it("absorbs queued assignment mutation wakes for distinct issues into one adapter run", async () => {
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueIds = [randomUUID(), randomUUID(), randomUUID()];
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Gateway Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: { "x-openclaw-token": "gateway-token" },
+          payloadTemplate: { message: "wake now" },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+
+      await db.insert(issues).values(issueIds.map((issueId, index) => ({
+        id: issueId,
+        companyId,
+        title: `Mutation issue ${index + 1}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        responsibleUserId: "responsible-user",
+        assigneeAgentId: agentId,
+        issueNumber: index + 1,
+        identifier: `${issuePrefix}-${index + 1}`,
+      })));
+
+      const wakeIssue = (issueId: string) => heartbeat.wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_updated",
+        payload: { issueId, mutation: "issue_updated" },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_updated",
+          skipIssueComment: true,
+        },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+      });
+
+      const firstRun = await wakeIssue(issueIds[0]!);
+      expect(firstRun).not.toBeNull();
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+
+      const secondRun = await wakeIssue(issueIds[1]!);
+      const thirdRun = await wakeIssue(issueIds[2]!);
+      expect(secondRun).not.toBeNull();
+      expect(thirdRun).not.toBeNull();
+      const queuedRuns = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, [secondRun!.id, thirdRun!.id]));
+      expect(queuedRuns).toEqual(expect.arrayContaining([
+        { id: secondRun!.id, status: "queued" },
+        { id: thirdRun!.id, status: "queued" },
+      ]));
+
+      await db
+        .update(issues)
+        .set({ status: "done" })
+        .where(eq(issues.id, issueIds[0]!));
+      gateway.releaseFirstWait();
+      await waitFor(() => gateway.getAgentPayloads().length >= 2);
+
+      const secondPayload = gateway.getAgentPayloads()[1] ?? {};
+      const batchRunId = typeof secondPayload.idempotencyKey === "string"
+        ? secondPayload.idempotencyKey
+        : null;
+      expect([secondRun!.id, thirdRun!.id]).toContain(batchRunId);
+      const absorbedRun = [secondRun!, thirdRun!].find((candidate) => candidate.id !== batchRunId)!;
+      const claimedRunContext = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, batchRunId!))
+        .then((rows) => rows[0]?.contextSnapshot ?? null);
+      expect(claimedRunContext).toMatchObject({ assignmentWakeBatchCount: 2 });
+      const secondWake = parseWakePayloadFromMessage(secondPayload.message);
+      expect(secondWake).toMatchObject({
+        assignmentWakeBatch: {
+          issueCount: 2,
+          absorbedRunCount: 1,
+        },
+      });
+      expect(
+        (secondWake?.assignmentWakeBatch as { issues?: Array<{ issueId?: string }> } | undefined)
+          ?.issues?.map((item) => item.issueId),
+      ).toEqual(batchRunId === secondRun!.id
+        ? [issueIds[1], issueIds[2]]
+        : [issueIds[2], issueIds[1]]);
+
+      await waitFor(async () => {
+        const absorbed = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, absorbedRun.id))
+          .then((rows) => rows[0] ?? null);
+        return absorbed?.status === "cancelled";
+      });
+
+      const absorbedWakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, absorbedRun.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(absorbedWakeup).toMatchObject({
+        status: "coalesced",
+        runId: batchRunId,
+        coalescedCount: 1,
+      });
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 30_000);
 });

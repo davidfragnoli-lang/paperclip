@@ -44,6 +44,9 @@ import {
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
   scrubGitCredentialText,
+  selectCheckoutPolicyCandidateCwd,
+  selectCheckoutBoundExecutionWorkspacePolicy,
+  applyCheckoutBoundProjectWorkspaceContext,
   buildAnchorFallbackWorkspaceNotes,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
@@ -925,6 +928,194 @@ describe("buildAnchorFallbackWorkspaceNotes", () => {
       'Failed to prepare the project workspace checkout: authentication failed. Using fallback workspace "/fallback" for this run.',
       'Project workspace path "/missing/path" is not available yet. Using fallback workspace "/fallback" for this run.',
     ]);
+  });
+});
+
+describe("selectCheckoutBoundExecutionWorkspacePolicy", () => {
+  const isolationPolicy = {
+    enabled: true,
+    defaultMode: "isolated_workspace",
+    allowIssueOverride: false,
+    workspaceStrategy: {
+      type: "git_worktree",
+      branchTemplate: "work/{{issue.identifier}}",
+      worktreeParentDir: "/paperclip/worktrees",
+    },
+  };
+  const servingWorkspace = {
+    projectId: "paperclip-runtime-project",
+    workspaceId: "paperclip-runtime-workspace",
+    cwd: "/srv/paperclip-runtime",
+    executionWorkspacePolicy: isolationPolicy,
+  };
+
+  it("binds a project-less lane to the isolation policy of its resolved checkout", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/srv/paperclip-runtime"],
+      workspaceRows: [servingWorkspace],
+    })).toEqual({
+      projectId: "paperclip-runtime-project",
+      workspaceId: "paperclip-runtime-workspace",
+      cwd: "/srv/paperclip-runtime",
+      policy: isolationPolicy,
+    });
+  });
+
+  it("binds a resumed project-less lane from the configured worktree parent", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/paperclip/worktrees"],
+      workspaceRows: [servingWorkspace],
+    })).toEqual({
+      projectId: "paperclip-runtime-project",
+      workspaceId: "paperclip-runtime-workspace",
+      cwd: "/srv/paperclip-runtime",
+      policy: isolationPolicy,
+    });
+  });
+
+  it("normalizes dot segments and trailing separators before matching a checkout", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/srv/checkouts/../paperclip-runtime/./"],
+      workspaceRows: [servingWorkspace],
+    })).toEqual({
+      projectId: "paperclip-runtime-project",
+      workspaceId: "paperclip-runtime-workspace",
+      cwd: "/srv/paperclip-runtime",
+      policy: isolationPolicy,
+    });
+  });
+
+  it("normalizes a nested resumed-worktree path before matching its configured parent", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/paperclip/worktrees/./FRA-24146/../FRA-24146/"],
+      workspaceRows: [servingWorkspace],
+    })).toEqual({
+      projectId: "paperclip-runtime-project",
+      workspaceId: "paperclip-runtime-workspace",
+      cwd: "/srv/paperclip-runtime",
+      policy: isolationPolicy,
+    });
+  });
+
+  it("does not isolate a project-less lane resolved to an unrelated checkout", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: null,
+      candidateCwds: ["/srv/unrelated-repo"],
+      workspaceRows: [servingWorkspace],
+    })).toBeNull();
+  });
+
+  it("keeps project membership authoritative when the issue is already tagged", () => {
+    expect(selectCheckoutBoundExecutionWorkspacePolicy({
+      issueProjectId: "other-project",
+      candidateCwds: ["/srv/paperclip-runtime"],
+      workspaceRows: [servingWorkspace],
+    })).toBeNull();
+  });
+});
+
+describe("selectCheckoutPolicyCandidateCwd", () => {
+  it("binds a fresh project-less lane from its issue-scoped checkout override", () => {
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: null,
+      issueOverrideCwd: "/srv/paperclip-runtime",
+      taskSessionCwd: null,
+      agentConfigCwd: null,
+    })).toBe("/srv/paperclip-runtime");
+  });
+
+  it("uses the most specific declared checkout source", () => {
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: "/resume",
+      issueOverrideCwd: "/issue",
+      taskSessionCwd: "/session",
+      agentConfigCwd: "/agent",
+    })).toBe("/resume");
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: null,
+      issueOverrideCwd: "/issue",
+      taskSessionCwd: "/session",
+      agentConfigCwd: "/agent",
+    })).toBe("/issue");
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: null,
+      issueOverrideCwd: null,
+      taskSessionCwd: "/session",
+      agentConfigCwd: "/agent",
+    })).toBe("/session");
+    expect(selectCheckoutPolicyCandidateCwd({
+      explicitResumeCwd: null,
+      issueOverrideCwd: null,
+      taskSessionCwd: null,
+      agentConfigCwd: "/agent",
+    })).toBe("/agent");
+  });
+});
+
+describe("applyCheckoutBoundProjectWorkspaceContext", () => {
+  it("hydrates project and workspace context from a checkout-bound match", () => {
+    const context: Record<string, unknown> = {};
+
+    applyCheckoutBoundProjectWorkspaceContext({
+      context,
+      issueProjectId: null,
+      match: {
+        projectId: "paperclip-runtime-project",
+        workspaceId: "paperclip-runtime-workspace",
+        cwd: "/srv/paperclip-runtime",
+        policy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "work/{{issue.identifier}}",
+            worktreeParentDir: "/paperclip/worktrees",
+          },
+        },
+      },
+    });
+
+    expect(context).toMatchObject({
+      projectId: "paperclip-runtime-project",
+      projectWorkspaceId: "paperclip-runtime-workspace",
+    });
+  });
+
+  it("does not overwrite an explicit issue project binding", () => {
+    const context: Record<string, unknown> = {
+      projectId: "explicit-project",
+      projectWorkspaceId: "explicit-workspace",
+    };
+
+    applyCheckoutBoundProjectWorkspaceContext({
+      context,
+      issueProjectId: "explicit-project",
+      match: {
+        projectId: "paperclip-runtime-project",
+        workspaceId: "paperclip-runtime-workspace",
+        cwd: "/srv/paperclip-runtime",
+        policy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "work/{{issue.identifier}}",
+            worktreeParentDir: "/paperclip/worktrees",
+          },
+        },
+      },
+    });
+
+    expect(context).toEqual({
+      projectId: "explicit-project",
+      projectWorkspaceId: "explicit-workspace",
+    });
   });
 });
 

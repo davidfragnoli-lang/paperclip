@@ -1,22 +1,66 @@
+import path from "node:path";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import pino from "pino";
 import { pinoHttp } from "pino-http";
+import { readConfigFile } from "../config-file.js";
+import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
 import { redactSensitive } from "./redact-sensitive.js";
+import {
+  DEFAULT_SERVER_LOG_MAX_ARCHIVES,
+  DEFAULT_SERVER_LOG_MAX_BYTES,
+} from "./rotating-file-stream.js";
 
+function resolveServerLogDir(): string {
+  const envOverride = process.env.PAPERCLIP_LOG_DIR?.trim();
+  if (envOverride) return resolveHomeAwarePath(envOverride);
+
+  const fileLogDir = readConfigFile()?.logging.logDir?.trim();
+  if (fileLogDir) return resolveHomeAwarePath(fileLogDir);
+
+  return resolveDefaultLogsDir();
+}
+
+const logDir = resolveServerLogDir();
+fs.mkdirSync(logDir, { recursive: true });
+
+const logFile = path.join(logDir, "server.log");
+const rotatingFileTransport = fileURLToPath(new URL("./rotating-file-transport.js", import.meta.url));
 const sharedOpts = {
   translateTime: "SYS:HH:MM:ss",
   ignore: "pid,hostname",
   singleLine: true,
 };
 
-const isProduction = process.env.NODE_ENV === "production";
-export const logger = isProduction
-  ? pino({ level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info", redact: [...HTTP_LOG_REDACT_PATHS] })
-  : pino({ level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "debug", redact: [...HTTP_LOG_REDACT_PATHS] }, pino.transport({
-      target: "pino-pretty",
-      options: { ...sharedOpts, ignore: "pid,hostname,req,res,responseTime", colorize: true, destination: 1 },
-    }));
+const loggerOptions = {
+  level: process.env.NODE_ENV === "test" ? "silent" : process.env.PAPERCLIP_LOG_LEVEL?.trim() || "debug",
+  redact: [...HTTP_LOG_REDACT_PATHS],
+};
+
+export const logger = process.env.NODE_ENV === "test"
+  ? pino(loggerOptions)
+  : pino(loggerOptions, pino.transport({
+    targets: [
+      {
+        target: "pino-pretty",
+        options: { ...sharedOpts, ignore: "pid,hostname,req,res,responseTime", colorize: true, destination: 1 },
+        level: "info",
+      },
+      {
+        target: rotatingFileTransport,
+        options: {
+          ...sharedOpts,
+          colorize: false,
+          logFile,
+          maxBytes: DEFAULT_SERVER_LOG_MAX_BYTES,
+          maxArchives: DEFAULT_SERVER_LOG_MAX_ARCHIVES,
+        },
+        level: "debug",
+      },
+    ],
+  }));
 
 export const httpLogger = pinoHttp({
   logger,

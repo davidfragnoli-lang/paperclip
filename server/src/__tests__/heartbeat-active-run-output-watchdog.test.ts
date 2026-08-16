@@ -743,6 +743,46 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
   });
 
+  it("does not classify severed hot-restart output capture as run silence", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const adoptedAt = new Date(now.getTime() - 10 * 60 * 1000);
+    const deadlineAt = new Date(now.getTime() + 20 * 60 * 1000);
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          hotRestart: {
+            adopted: true,
+            adoptedAt: adoptedAt.toISOString(),
+            outputCaptureState: "severed",
+            outputCaptureSeveredAt: adoptedAt.toISOString(),
+            adoptedRunDeadlineAt: deadlineAt.toISOString(),
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const heartbeat = heartbeatService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+    const scan = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(scan).toMatchObject({ scanned: 0, created: 0, escalated: 0 });
+
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    await expect(recovery.buildRunOutputSilence(run, now)).resolves.toMatchObject({
+      level: "not_applicable",
+      silenceStartedAt: null,
+      silenceAgeMs: null,
+      outputCaptureState: "severed",
+      outputCaptureSeveredAt: adoptedAt,
+      adoptedRunDeadlineAt: deadlineAt,
+    });
+  });
+
   it("re-arms continue decisions after the default quiet window", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, managerId, runId } = await seedRunningRun({

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
@@ -40,6 +40,60 @@ export interface TerminalResultCleanupOptions {
 export const UNMANAGED_BACKGROUND_TASK_STOP_REASON = "unmanaged_background_task_stopped";
 export const UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON =
   "unmanaged background task stopped; no durable live path";
+export const LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME = "local-child-completion.json";
+
+const LOCAL_CHILD_COMPLETION_WRAPPER_SOURCE = String.raw`
+const { spawn } = require("node:child_process");
+const fs = require("node:fs/promises");
+const path = require("node:path");
+
+const config = JSON.parse(process.env.PAPERCLIP_LOCAL_CHILD_WRAPPER_CONFIG || "{}");
+delete process.env.PAPERCLIP_LOCAL_CHILD_WRAPPER_CONFIG;
+let completed = false;
+
+async function persistCompletion(exitCode, signal, errorMessage) {
+  if (completed) return;
+  completed = true;
+  const envelope = {
+    version: 1,
+    runId: config.runId,
+    exitCode,
+    signal,
+    completedAt: new Date().toISOString(),
+    errorMessage: errorMessage || null,
+  };
+  const temporaryPath = config.completionPath + "." + process.pid + ".tmp";
+  await fs.mkdir(path.dirname(config.completionPath), { recursive: true });
+  await fs.writeFile(temporaryPath, JSON.stringify(envelope) + "\n", { mode: 0o600 });
+  await fs.rename(temporaryPath, config.completionPath);
+}
+
+process.stdout.on("error", () => {});
+process.stderr.on("error", () => {});
+
+const child = spawn(config.command, config.args, {
+  cwd: config.cwd,
+  env: process.env,
+  detached: false,
+  shell: false,
+  stdio: ["pipe", "pipe", "pipe"],
+});
+
+if (process.stdin.readable && child.stdin) process.stdin.pipe(child.stdin);
+child.stdout.on("data", (chunk) => { if (!process.stdout.destroyed) process.stdout.write(chunk); });
+child.stderr.on("data", (chunk) => { if (!process.stderr.destroyed) process.stderr.write(chunk); });
+child.on("error", async (error) => {
+  await persistCompletion(null, null, error instanceof Error ? error.message : String(error)).catch(() => {});
+  process.exitCode = 1;
+});
+child.on("close", async (code, signal) => {
+  await persistCompletion(code, signal, null).catch((error) => {
+    if (!process.stderr.destroyed) process.stderr.write("[paperclip] Failed to persist child completion: " + String(error) + "\n");
+    process.exitCode = 1;
+  });
+  if (process.exitCode == null) process.exitCode = code == null ? (signal ? 1 : 0) : code;
+});
+`;
 
 export interface TerminalResultCleanupEvidence {
   kind: "terminal_result_cleanup";
@@ -55,6 +109,7 @@ interface RunningProcess {
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;
+  retainedDescendantPids?: Set<number>;
 }
 
 interface SpawnTarget {
@@ -84,18 +139,105 @@ function resolveProcessGroupId(child: ChildProcess) {
   return typeof child.pid === "number" && child.pid > 0 ? child.pid : null;
 }
 
-// Exported so the direct-child fallback branch can be unit-tested directly.
-export function signalRunningProcess(
-  running: Pick<RunningProcess, "child" | "processGroupId">,
+function collectDescendantProcessIds(rootPid: number, retained: Set<number>) {
+  if (process.platform === "win32" || !Number.isInteger(rootPid) || rootPid <= 0) return;
+  let output = "";
+  try {
+    output = execFileSync("ps", ["-axo", "pid=,ppid="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return;
+  }
+
+  const childrenByParent = new Map<number, number[]>();
+  for (const line of output.split("\n")) {
+    const [pidText, parentPidText] = line.trim().split(/\s+/);
+    const pid = Number.parseInt(pidText ?? "", 10);
+    const parentPid = Number.parseInt(parentPidText ?? "", 10);
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(parentPid) || parentPid < 0) continue;
+    const children = childrenByParent.get(parentPid) ?? [];
+    children.push(pid);
+    childrenByParent.set(parentPid, children);
+  }
+
+  const pending = [rootPid, ...retained];
+  const visited = new Set<number>();
+  while (pending.length > 0) {
+    const parentPid = pending.pop()!;
+    if (visited.has(parentPid)) continue;
+    visited.add(parentPid);
+    for (const childPid of childrenByParent.get(parentPid) ?? []) {
+      if (childPid === process.pid) continue;
+      retained.add(childPid);
+      pending.push(childPid);
+    }
+  }
+}
+
+export function signalProcessTree(
+  input: {
+    pid: number | null | undefined;
+    processGroupId: number | null | undefined;
+    retainedDescendantPids?: Set<number>;
+  },
   signal: NodeJS.Signals,
 ) {
-  if (process.platform !== "win32" && running.processGroupId && running.processGroupId > 0) {
+  const pid = input.pid ?? null;
+  const retained = input.retainedDescendantPids ?? new Set<number>();
+  if (pid === process.pid || input.processGroupId === process.pid) return retained;
+  if (typeof pid === "number" && pid > 0) collectDescendantProcessIds(pid, retained);
+
+  let groupSignaled = false;
+  if (
+    process.platform !== "win32" &&
+    typeof input.processGroupId === "number" &&
+    input.processGroupId > 0
+  ) {
     try {
-      process.kill(-running.processGroupId, signal);
-      return;
+      process.kill(-input.processGroupId, signal);
+      groupSignaled = true;
     } catch {
-      // Fall back to the direct child signal if group signaling fails.
+      // Fall back to direct PID signaling below.
     }
+  }
+
+  for (const descendantPid of Array.from(retained).reverse()) {
+    if (descendantPid === process.pid) continue;
+    try {
+      process.kill(descendantPid, signal);
+    } catch {
+      retained.delete(descendantPid);
+    }
+  }
+
+  if (!groupSignaled && typeof pid === "number" && pid > 0 && pid !== process.pid) {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Ignore cleanup races.
+    }
+  }
+  return retained;
+}
+
+// Exported so the direct-child fallback branch can be unit-tested directly.
+export function signalRunningProcess(
+  running: Pick<RunningProcess, "child" | "processGroupId" | "retainedDescendantPids">,
+  signal: NodeJS.Signals,
+) {
+  const pid = running.child.pid ?? null;
+  if (pid || running.processGroupId) {
+    signalProcessTree(
+      {
+        pid,
+        processGroupId: running.processGroupId,
+        retainedDescendantPids: running.retainedDescendantPids,
+      },
+      signal,
+    );
+    if (running.processGroupId) return;
   }
   // Gate on real liveness: `child.killed` only means a signal was sent, not that
   // the process exited, so escalating on it would suppress a follow-up SIGKILL.
@@ -670,10 +812,30 @@ type PaperclipWakeRecovery = {
   routingFallbackReason: string | null;
 };
 
+type PaperclipAssignmentWakeBatch = {
+  issueCount: number;
+  absorbedRunCount: number;
+  instruction: string | null;
+  issues: Array<{
+    issueId: string;
+    mutation: string | null;
+    wakeReason: string | null;
+    taskKey: string | null;
+    issue: {
+      id: string;
+      identifier: string | null;
+      title: string;
+      status: string;
+      priority: string;
+    } | null;
+  }>;
+};
+
 type PaperclipWakePayload = {
   reason: string | null;
   recovery: PaperclipWakeRecovery | null;
   issue: PaperclipWakeIssue | null;
+  assignmentWakeBatch: PaperclipAssignmentWakeBatch | null;
   checkedOutByHarness: boolean;
   // Experimental: write user-interaction content in ASD-STE100 Simplified
   // Technical English with brief decision context.
@@ -724,6 +886,41 @@ function normalizePaperclipWakeRecovery(value: unknown): PaperclipWakeRecovery |
     maxAttempts: typeof recovery.maxAttempts === "number" ? recovery.maxAttempts : null,
     nextAction: asString(recovery.nextAction, "").trim() || null,
     routingFallbackReason: asString(recovery.routingFallbackReason, "").trim() || null,
+  };
+}
+
+function normalizePaperclipAssignmentWakeBatch(value: unknown): PaperclipAssignmentWakeBatch | null {
+  const batch = parseObject(value);
+  const issues = Array.isArray(batch.issues)
+    ? batch.issues.flatMap((rawItem) => {
+        const item = parseObject(rawItem);
+        const issueId = asString(item.issueId, "").trim();
+        if (!issueId) return [];
+        const rawIssue = parseObject(item.issue);
+        const id = asString(rawIssue.id, "").trim();
+        return [{
+          issueId,
+          mutation: asString(item.mutation, "").trim() || null,
+          wakeReason: asString(item.wakeReason, "").trim() || null,
+          taskKey: asString(item.taskKey, "").trim() || null,
+          issue: id
+            ? {
+                id,
+                identifier: asString(rawIssue.identifier, "").trim() || null,
+                title: asString(rawIssue.title, "").trim(),
+                status: asString(rawIssue.status, "").trim(),
+                priority: asString(rawIssue.priority, "").trim(),
+              }
+            : null,
+        }];
+      })
+    : [];
+  if (issues.length === 0) return null;
+  return {
+    issueCount: Math.max(issues.length, Math.floor(asNumber(batch.issueCount, issues.length))),
+    absorbedRunCount: Math.max(0, Math.floor(asNumber(batch.absorbedRunCount, 0))),
+    instruction: asString(batch.instruction, "").trim() || null,
+    issues,
   };
 }
 
@@ -1337,6 +1534,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
   const livenessContinuation = normalizePaperclipWakeLivenessContinuation(payload.livenessContinuation);
   const taskWatchdog = normalizePaperclipWakeTaskWatchdog(payload.taskWatchdog);
   const recovery = normalizePaperclipWakeRecovery(payload.recovery);
+  const assignmentWakeBatch = normalizePaperclipAssignmentWakeBatch(payload.assignmentWakeBatch);
   const childIssueSummaries = Array.isArray(payload.childIssueSummaries)
     ? payload.childIssueSummaries
         .map((entry) => normalizePaperclipWakeChildIssueSummary(entry))
@@ -1357,7 +1555,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
   const checkboxSelection = normalizePaperclipWakeCheckboxSelection(payload.checkboxSelection);
   const executionWorkspace = normalizePaperclipWakeExecutionWorkspace(payload.executionWorkspace);
   const agentMessage = normalizePaperclipWakeAgentMessage(payload.agentMessage);
-  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !documentReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !agentMessage && !recovery && !normalizePaperclipWakeIssue(payload.issue)) {
+  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !documentReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !agentMessage && !recovery && !assignmentWakeBatch && !normalizePaperclipWakeIssue(payload.issue)) {
     return null;
   }
 
@@ -1365,6 +1563,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     reason: asString(payload.reason, "").trim() || null,
     recovery,
     issue: normalizePaperclipWakeIssue(payload.issue),
+    assignmentWakeBatch,
     checkedOutByHarness: asBoolean(payload.checkedOutByHarness, false),
     simplifiedEnglishInteractions: asBoolean(payload.simplifiedEnglishInteractions, false),
     dependencyBlockedInteraction: asBoolean(payload.dependencyBlockedInteraction, false),
@@ -1553,6 +1752,12 @@ export function renderPaperclipWakePrompt(
   const wakeSummaryLines = [
     `- reason: ${normalized.reason ?? "unknown"}`,
     `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
+    ...(normalized.assignmentWakeBatch
+      ? [
+          `- assignment mutation batch: ${normalized.assignmentWakeBatch.issueCount} issues (${normalized.assignmentWakeBatch.absorbedRunCount} queued runs absorbed)`,
+          `- batch instruction: ${normalized.assignmentWakeBatch.instruction ?? "Review all listed issue mutations in this session."}`,
+        ]
+      : []),
     ...(hasWakeCommentBatch
       ? [
           `- pending comments: ${normalized.includedCount}/${normalized.requestedCount}`,
@@ -2083,14 +2288,18 @@ export function buildPaperclipEnv(agent: { id: string; companyId: string }): Rec
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",
   );
   const runtimePort = process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100";
-  // An explicit PAPERCLIP_API_URL override must win over the URL derived from
-  // authPublicBaseUrl: the derived URL can be unreachable from inside the
-  // runtime container (e.g. when the public base URL is VPN/tailnet-only).
-  const apiUrl =
-    process.env.PAPERCLIP_API_URL ??
-    process.env.PAPERCLIP_RUNTIME_API_URL ??
-    `http://${runtimeHost}:${runtimePort}`;
-  vars.PAPERCLIP_API_URL = apiUrl;
+  const runtimeApiCandidates = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON?.trim();
+  // Once the server publishes its candidate set, local agent processes must
+  // receive the reachable runtime URL while retaining the public URL as a
+  // fallback candidate. Before server startup, preserve an explicit caller
+  // override over the derived runtime URL.
+  const apiUrl = runtimeApiCandidates
+    ? process.env.PAPERCLIP_RUNTIME_API_URL ?? process.env.PAPERCLIP_API_URL
+    : process.env.PAPERCLIP_API_URL ?? process.env.PAPERCLIP_RUNTIME_API_URL;
+  vars.PAPERCLIP_API_URL = apiUrl ?? `http://${runtimeHost}:${runtimePort}`;
+  if (runtimeApiCandidates) {
+    vars.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = runtimeApiCandidates;
+  }
   return vars;
 }
 
@@ -3339,13 +3548,36 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
-        const child = spawn(target.command, target.args, {
+        const runScratchDir = childEnv.PAPERCLIP_RUN_SCRATCH_DIR?.trim();
+        const completionPath = runScratchDir
+          ? path.join(runScratchDir, LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME)
+          : null;
+        const useDurableCompletionWrapper = Boolean(
+          completionPath && !opts.remoteExecution,
+        );
+        if (useDurableCompletionWrapper) {
+          childEnv.PAPERCLIP_LOCAL_CHILD_WRAPPER_CONFIG = JSON.stringify({
+            version: 1,
+            runId,
+            command: target.command,
+            args: target.args,
+            cwd: target.cwd ?? opts.cwd,
+            completionPath,
+          });
+        }
+        const child = spawn(
+          useDurableCompletionWrapper ? process.execPath : target.command,
+          useDurableCompletionWrapper
+            ? ["-e", LOCAL_CHILD_COMPLETION_WRAPPER_SOURCE]
+            : target.args,
+          {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
           detached: process.platform !== "win32",
           shell: false,
           stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
-        }) as ChildProcessWithEvents;
+          },
+        ) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
@@ -3356,7 +3588,13 @@ export async function runChildProcess(
             })
             : Promise.resolve();
 
-        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
+        const retainedDescendantPids = new Set<number>();
+        runningProcesses.set(runId, {
+          child,
+          graceSec: opts.graceSec,
+          processGroupId,
+          retainedDescendantPids,
+        });
 
         let timedOut = false;
         let stdout = "";
@@ -3406,12 +3644,12 @@ export async function runChildProcess(
             if (terminalCleanupStarted || timedOut) return;
             terminalCleanupStarted = true;
             terminalCleanupSignal = "SIGTERM";
-            signalRunningProcess({ child, processGroupId }, "SIGTERM");
+            signalRunningProcess({ child, processGroupId, retainedDescendantPids }, "SIGTERM");
             terminalCleanupKillTimer = setTimeout(() => {
               terminalCleanupKillTimer = null;
               terminalCleanupSignal = "SIGKILL";
               terminalCleanupForceKilled = true;
-              signalRunningProcess({ child, processGroupId }, "SIGKILL");
+              signalRunningProcess({ child, processGroupId, retainedDescendantPids }, "SIGKILL");
             }, Math.max(1, opts.graceSec) * 1000);
           }, graceMs);
         };
@@ -3421,9 +3659,9 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
-                signalRunningProcess({ child, processGroupId }, "SIGTERM");
+                signalRunningProcess({ child, processGroupId, retainedDescendantPids }, "SIGTERM");
                 setTimeout(() => {
-                  signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                  signalRunningProcess({ child, processGroupId, retainedDescendantPids }, "SIGKILL");
                 }, Math.max(1, opts.graceSec) * 1000);
               }, opts.timeoutSec * 1000)
             : null;

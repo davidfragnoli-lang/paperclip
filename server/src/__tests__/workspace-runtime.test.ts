@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
@@ -345,6 +345,15 @@ function createWorkspaceOperationRecorderDouble() {
   return { recorder, operations };
 }
 
+let testIsolationPaperclipHome: string | null = null;
+
+beforeEach(async () => {
+  testIsolationPaperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-runtime-home-"));
+  process.env.PAPERCLIP_HOME = testIsolationPaperclipHome;
+  delete process.env.PAPERCLIP_CONFIG;
+  delete process.env.PAPERCLIP_INSTANCE_ID;
+});
+
 afterEach(async () => {
   await Promise.all(
     Array.from(leasedRunIds).map(async (runId) => {
@@ -357,7 +366,11 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_INSTANCE_ID;
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
-  await resetRuntimeServicesForTests();
+  await resetRuntimeServicesForTests({ terminateProcesses: true });
+  if (testIsolationPaperclipHome) {
+    await fs.rm(testIsolationPaperclipHome, { recursive: true, force: true });
+    testIsolationPaperclipHome = null;
+  }
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
@@ -3551,6 +3564,7 @@ describe("realizeExecutionWorkspace", () => {
     const instanceId = deriveWorktreeInstanceId(workspace.cwd);
     const instanceRoot = path.join(worktreesDir, "instances", instanceId);
     await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
+    const canonicalInstanceRoot = await fs.realpath(instanceRoot);
     await fs.mkdir(path.join(workspace.cwd, ".paperclip"), { recursive: true });
     await fs.writeFile(
       path.join(workspace.cwd, ".paperclip", ".env"),
@@ -3592,7 +3606,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(operations[0]?.command).toBe("printf 'cleanup ok\\n'");
     expect(operations[1]?.metadata).toMatchObject({
       cleanupAction: "remove_worktree_instance",
-      instanceRoot,
+      instanceRoot: canonicalInstanceRoot,
     });
     expect(operations[2]?.metadata).toMatchObject({
       cleanupAction: "worktree_remove",
@@ -4644,9 +4658,35 @@ describe("resolveShell (shell fallback)", () => {
 
 describe("readLocalServicePortOwner", () => {
   const originalPlatform = process.platform;
+  const originalPath = process.env.PATH;
 
   afterEach(() => {
     Object.defineProperty(process, "platform", { value: originalPlatform });
+    process.env.PATH = originalPath;
+  });
+
+  it("uses the macOS system lsof when the agent PATH omits sbin", async () => {
+    if (process.platform !== "darwin") return;
+    try {
+      await fs.access("/usr/sbin/lsof");
+    } catch {
+      return;
+    }
+
+    process.env.PATH = "/usr/local/bin:/usr/bin:/bin";
+    const server = net.createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : null;
+      expect(port).toBeTypeOf("number");
+
+      await expect(readLocalServicePortOwner(port!)).resolves.toBe(process.pid);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+    }
   });
 
   it("detects the owner of a listening TCP port", async () => {
@@ -5493,7 +5533,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
   });
 
   afterEach(async () => {
-    await resetRuntimeServicesForTests();
+    await resetRuntimeServicesForTests({ terminateProcesses: true });
     await db.delete(workspaceRuntimeServices);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);

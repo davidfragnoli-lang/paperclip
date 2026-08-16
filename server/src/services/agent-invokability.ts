@@ -38,6 +38,9 @@ export const DIRECT_NON_INVOKABLE_STATUSES = new Set<AgentStatus>([
   "pending_approval",
 ]);
 
+export const AGENT_NOT_INVOKABLE_FAILURE_REASON =
+  "Agent is not invokable in its current state";
+
 function blocked(
   reason: AgentInvokabilityBlockReason,
   message: string,
@@ -91,7 +94,7 @@ export function evaluateAgentInvokability(
   if (directStatusReason) {
     return blocked(
       directStatusReason,
-      "Agent is not invokable in its current state",
+      AGENT_NOT_INVOKABLE_FAILURE_REASON,
       { agentId: agent.id, agentStatus: agent.status },
       false,
     );

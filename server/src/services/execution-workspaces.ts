@@ -2431,7 +2431,23 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // that became eligible are never revisited. The frozen bound makes the
       // rotation cover a finite set, so the cursor always reaches a short page.
       if (!cursor) {
-        terminalSweepBoundary = now();
+        // Candidate timestamps are written by PostgreSQL. Derive the boundary
+        // from those rows too: an application-clock boundary can be milliseconds
+        // behind the database clock and omit a candidate that already existed
+        // when the rotation started.
+        const latestCandidateUpdatedAt = await db
+          .select({ value: executionWorkspaces.updatedAt })
+          .from(executionWorkspaces)
+          .where(baseCandidateFilter)
+          .orderBy(desc(executionWorkspaces.updatedAt), desc(executionWorkspaces.id))
+          .limit(1)
+          .then((rows) => rows[0]?.value ?? null);
+        // PostgreSQL timestamps retain microseconds while JavaScript Date keeps
+        // milliseconds. Round the inclusive upper bound up by one millisecond so
+        // the row that supplied it cannot be truncated just below itself.
+        terminalSweepBoundary = latestCandidateUpdatedAt
+          ? new Date(latestCandidateUpdatedAt.getTime() + 1)
+          : null;
       }
       const boundary = terminalSweepBoundary;
       const boundaryFilter = boundary

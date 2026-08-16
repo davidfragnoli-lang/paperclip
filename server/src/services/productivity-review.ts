@@ -704,12 +704,73 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     ].join("\n");
   }
 
+  async function enqueueReviewWake(
+    ownerAgentId: string,
+    reviewIssueId: string,
+    evidence: ProductivityReviewEvidence,
+  ) {
+    if (!deps?.enqueueWakeup) return;
+    await deps.enqueueWakeup(ownerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: withRecoveryModelProfileHint({
+        issueId: reviewIssueId,
+        sourceIssueId: evidence.sourceIssue.id,
+        trigger: evidence.trigger,
+      }, "status_only"),
+      requestedByActorType: "system",
+      requestedByActorId: "productivity_review",
+      contextSnapshot: withRecoveryModelProfileHint({
+        issueId: reviewIssueId,
+        taskId: reviewIssueId,
+        wakeReason: "issue_assigned",
+        source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        sourceIssueId: evidence.sourceIssue.id,
+        productivityReviewTrigger: evidence.trigger,
+      }, "status_only"),
+    });
+  }
+
   async function createOrUpdateReview(
     evidence: ProductivityReviewEvidence,
     opts: { prefix: string; thresholds: ProductivityReviewThresholds },
   ) {
     const existing = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
     if (existing) {
+      if (!existing.assigneeAgentId) {
+        const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
+        if (!ownerAgentId) {
+          return { kind: "owner_unresolved" as const, reviewIssueId: existing.id };
+        }
+        const repaired = await db
+          .update(issues)
+          .set({
+            assigneeAgentId: ownerAgentId,
+            assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+            updatedAt: evidence.generatedAt,
+          })
+          .where(and(eq(issues.id, existing.id), isNull(issues.assigneeAgentId)))
+          .returning({ id: issues.id });
+        if (repaired.length > 0) {
+          await logActivity(db, {
+            companyId: evidence.sourceIssue.companyId,
+            actorType: "system",
+            actorId: "system",
+            action: "issue.productivity_review_owner_repaired",
+            entityType: "issue",
+            entityId: existing.id,
+            agentId: ownerAgentId,
+            details: {
+              source: "productivity_review.reconcile",
+              sourceIssueId: evidence.sourceIssue.id,
+              trigger: evidence.trigger,
+            },
+          });
+          await enqueueReviewWake(ownerAgentId, existing.id, evidence);
+          return { kind: "owner_repaired" as const, reviewIssueId: existing.id };
+        }
+      }
       const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id);
       const lastRefreshOrCreationAt = refreshState.latestCreatedAt ?? existing.createdAt;
       if (
@@ -759,6 +820,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     }
 
     const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
+    if (!ownerAgentId) {
+      return { kind: "owner_unresolved" as const, reviewIssueId: null };
+    }
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {
@@ -812,28 +876,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       },
     });
 
-    if (ownerAgentId && deps?.enqueueWakeup) {
-      await deps.enqueueWakeup(ownerAgentId, {
-        source: "assignment",
-        triggerDetail: "system",
-        reason: "issue_assigned",
-        payload: withRecoveryModelProfileHint({
-          issueId: review.id,
-          sourceIssueId: evidence.sourceIssue.id,
-          trigger: evidence.trigger,
-        }, "status_only"),
-        requestedByActorType: "system",
-        requestedByActorId: "productivity_review",
-        contextSnapshot: withRecoveryModelProfileHint({
-          issueId: review.id,
-          taskId: review.id,
-          wakeReason: "issue_assigned",
-          source: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
-          sourceIssueId: evidence.sourceIssue.id,
-          productivityReviewTrigger: evidence.trigger,
-        }, "status_only"),
-      });
-    }
+    await enqueueReviewWake(ownerAgentId, review.id, evidence);
 
     return { kind: "created" as const, reviewIssueId: review.id };
   }
@@ -871,6 +914,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       snoozed: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
+      ownerUnresolved: 0,
+      ownerRepaired: 0,
       skipped: 0,
       failed: 0,
       reviewIssueIds: [] as string[],
@@ -917,6 +962,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "creation_capped") result.creationCapped += 1;
         else if (outcome.kind === "no_action_suppressed") result.noActionSuppressed += 1;
+        else if (outcome.kind === "owner_unresolved") result.ownerUnresolved += 1;
+        else if (outcome.kind === "owner_repaired") result.ownerRepaired += 1;
         else result.existing += 1;
         if (outcome.reviewIssueId) result.reviewIssueIds.push(outcome.reviewIssueId);
       } catch (err) {

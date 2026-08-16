@@ -1879,6 +1879,10 @@ const BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES = ["pending"];
 const BLOCKER_ATTENTION_PENDING_APPROVAL_STATUSES = ["pending", "revision_requested"];
 const BLOCKER_ATTENTION_OPEN_RECOVERY_ORIGIN_KIND = "harness_liveness_escalation";
 const BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES = ["done", "cancelled"];
+const BLOCKER_ATTENTION_CHILD_NONBLOCKING_STATUSES = [
+  ...BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES,
+  "backlog",
+];
 const PRODUCTIVITY_REVIEW_ORIGIN_KIND = "issue_productivity_review";
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"];
 const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
@@ -2405,7 +2409,7 @@ async function listIssueBlockerAttentionMap(
           and(
             eq(issues.companyId, companyId),
             inArray(issues.parentId, chunk),
-            notInArray(issues.status, BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES),
+            notInArray(issues.status, BLOCKER_ATTENTION_CHILD_NONBLOCKING_STATUSES),
           ),
         );
       const [explicitBlockerRows, childRows] = await Promise.all([
@@ -3856,6 +3860,11 @@ async function listIssueBlockedInboxAttentionMap(
     issueId: row.issueId,
     status: "pending",
   }));
+  const issuesWithLiveExecution = new Set<string>([
+    ...(activeRunRows as Array<{ issueId: string | null }>),
+    ...(wakeRows as Array<{ issueId: string | null }>),
+    ...(scheduledRetryRows as Array<{ issueId: string | null }>),
+  ].flatMap((row) => row.issueId ? [row.issueId] : []));
 
   const openRecoveryIssues = graphIssues
     .filter((issue) => BLOCKED_INBOX_RECOVERY_ORIGIN_KINDS.includes(issue.originKind as typeof BLOCKED_INBOX_RECOVERY_ORIGIN_KINDS[number]))

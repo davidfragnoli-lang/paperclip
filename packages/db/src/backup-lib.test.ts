@@ -1,10 +1,16 @@
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { gunzipSync } from "node:zlib";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  pruneOldBackups,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -52,6 +58,16 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 describe("createBufferedTextFileWriter", () => {
+  it("does not open a temporary file when aborted before the first write", async () => {
+    const tempDir = createTempDir("paperclip-buffered-writer-abort-");
+    const outputPath = path.join(tempDir, "backup.sql");
+    const writer = createBufferedTextFileWriter(outputPath, 16);
+
+    await writer.abort();
+
+    expect(fs.existsSync(outputPath)).toBe(false);
+  });
+
   it("preserves line boundaries across buffered flushes", async () => {
     const tempDir = createTempDir("paperclip-buffered-writer-");
     const outputPath = path.join(tempDir, "backup.sql");
@@ -71,6 +87,65 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+
+  it("cleans up the partial file when closing fails", async () => {
+    const tempDir = createTempDir("paperclip-buffered-writer-close-failure-");
+    const outputPath = path.join(tempDir, "backup.sql");
+    const originalOpen = fs.promises.open;
+    const openedHandles: fs.promises.FileHandle[] = [];
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (filePath, flags, mode) => {
+      const handle = await originalOpen(filePath, flags, mode);
+      openedHandles.push(handle);
+      return handle;
+    });
+    syncBuiltinESMExports();
+    const writer = createBufferedTextFileWriter(outputPath, 1);
+    writer.emit("partial backup");
+    await writer.drain();
+
+    try {
+      const openedHandle = openedHandles[0];
+      expect(openedHandle).toBeDefined();
+      await openedHandle!.close();
+      writer.emit("write after external close");
+      await expect(writer.close()).rejects.toThrow();
+      await writer.abort();
+      expect(fs.existsSync(outputPath)).toBe(false);
+    } finally {
+      openSpy.mockRestore();
+      syncBuiltinESMExports();
+      await Promise.all(openedHandles.map((handle) => handle.close().catch(() => {})));
+    }
+  });
+});
+
+describe("pruneOldBackups", () => {
+  it("caps backups from one day inside the daily tier", () => {
+    const backupDir = createTempDir("paperclip-db-backup-daily-cap-");
+    const realDateNow = Date.now;
+    Date.now = () => new Date("2026-08-15T18:30:00Z").getTime();
+
+    const backups = ["08-00-00", "10-00-00", "12-00-00", "14-00-00", "16-00-00"].map((time) => {
+      const file = path.join(backupDir, `paperclip-test-20260815-${time}.sql.gz`);
+      const mtime = new Date(`2026-08-15T${time.replaceAll("-", ":")}Z`);
+      fs.writeFileSync(file, time);
+      fs.utimesSync(file, mtime, mtime);
+      return file;
+    });
+
+    try {
+      const prunedCount = pruneOldBackups(
+        backupDir,
+        { dailyDays: 7, dailyBackupsPerDay: 2, weeklyWeeks: 4, monthlyMonths: 1 },
+        "paperclip-test",
+      );
+
+      expect(prunedCount).toBe(3);
+      expect(backups.map((file) => fs.existsSync(file))).toEqual([false, false, false, true, true]);
+    } finally {
+      Date.now = realDateNow;
+    }
   });
 });
 

@@ -3,7 +3,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   __embeddedPostgresStartMaxAttemptsForTests as MAX_ATTEMPTS,
   __setEmbeddedPostgresCtorProviderForTests,
+  __setEmbeddedPostgresSupportForTests,
   __startEmbeddedPostgresWithRetryForTests as startWithRetry,
+  getEmbeddedPostgresTestSupport,
 } from "./test-embedded-postgres.js";
 
 // A fake embedded-postgres constructor. It records every constructed instance so
@@ -109,5 +111,39 @@ describe("startEmbeddedPostgresWithRetry", () => {
     // The thrown message carries the captured Postgres output, not only the
     // generic "embedded Postgres startup failed" text.
     expect((error as Error).message).toContain("Address already in use");
+  });
+});
+
+describe("getEmbeddedPostgresTestSupport", () => {
+  const originalAllowSkip = process.env.PAPERCLIP_ALLOW_SKIP_EMBEDDED_POSTGRES;
+
+  afterEach(() => {
+    __setEmbeddedPostgresSupportForTests(null);
+    if (originalAllowSkip === undefined) {
+      delete process.env.PAPERCLIP_ALLOW_SKIP_EMBEDDED_POSTGRES;
+    } else {
+      process.env.PAPERCLIP_ALLOW_SKIP_EMBEDDED_POSTGRES = originalAllowSkip;
+    }
+  });
+
+  it("fails closed when embedded Postgres is unavailable", async () => {
+    delete process.env.PAPERCLIP_ALLOW_SKIP_EMBEDDED_POSTGRES;
+    __setEmbeddedPostgresSupportForTests({ supported: false, reason: "forced test failure" });
+
+    await expect(getEmbeddedPostgresTestSupport()).rejects.toThrow(
+      /PAPERCLIP_ALLOW_SKIP_EMBEDDED_POSTGRES=1/,
+    );
+  });
+
+  it("accepts 1 as the only explicit skip opt-out", async () => {
+    process.env.PAPERCLIP_ALLOW_SKIP_EMBEDDED_POSTGRES = "true";
+    __setEmbeddedPostgresSupportForTests({ supported: false, reason: "forced test failure" });
+    await expect(getEmbeddedPostgresTestSupport()).rejects.toThrow(/forced test failure/);
+
+    process.env.PAPERCLIP_ALLOW_SKIP_EMBEDDED_POSTGRES = "1";
+    await expect(getEmbeddedPostgresTestSupport()).resolves.toEqual({
+      supported: false,
+      reason: "forced test failure",
+    });
   });
 });

@@ -415,7 +415,8 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
   it("raises one soft incident per window before hard-stopping and safely logging agent telemetry", async () => {
     const { companyId, agentId } = await createBudgetFixture();
     const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
-    const service = budgetService(db, { cancelWorkForScope });
+    const recoverPauseDispatches = vi.fn().mockResolvedValue([]);
+    const service = budgetService(db, { cancelWorkForScope, recoverPauseDispatches });
     const [policy] = await db
       .insert(budgetPolicies)
       .values({
@@ -531,6 +532,23 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       expect(call.details).not.toHaveProperty("prompt");
       expect(call.details).not.toHaveProperty("message");
     }
+
+    const hardIncident = incidentRows.find((incident) => incident.thresholdType === "hard")!;
+    await service.resolveIncident(
+      companyId,
+      hardIncident.id,
+      { action: "raise_budget_and_resume", amount: 200 },
+      "board-user",
+    );
+    expect(recoverPauseDispatches).toHaveBeenCalledTimes(1);
+    expect(recoverPauseDispatches).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({
+        agentId,
+        pausedAt: expect.any(Date),
+        resumedAt: expect.any(Date),
+      }),
+    );
   });
 
   it("hard-stops project work until a valid budget raise resumes it and overview reconciles ledger spend", async () => {

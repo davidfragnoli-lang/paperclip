@@ -382,5 +382,5 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     await cleanup();
   }
 
-  return { status: "removed", instanceRoot: canonicalInstanceRoot, postgresStopped };
+  return { status: "removed", instanceRoot: configuredInstanceRoot, postgresStopped };
 }

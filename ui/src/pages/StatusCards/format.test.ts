@@ -31,11 +31,9 @@ function update(overrides: Partial<StatusCardUpdate>): StatusCardUpdate {
 }
 
 // A fixed instant rather than the real clock. `rollupUpdatesToday` filters on
-// the *UTC* day boundary, so a suite that builds its fixtures from `new Date()`
-// fails in two ways: it straddles midnight UTC if the run happens to cross it,
-// and in any zone east of UTC+12 "today at local noon" is already yesterday in
-// UTC, so the rows it means to count are filtered out. The function takes `now`
-// for exactly this reason — the sibling test below already passes one.
+// the UTC day boundary, so a suite that builds fixtures from `new Date()` can
+// straddle midnight or accidentally move "today" into yesterday for zones east
+// of UTC. Keep a stable UTC anchor and derive all fixture rows from it.
 const NOW = new Date("2026-07-23T12:00:00.000Z");
 
 function iso(daysAgo: number): string {
@@ -82,6 +80,18 @@ describe("rollupUpdatesToday", () => {
     const rollup = rollupUpdatesToday([
       update({ startedAt: "2026-07-23T00:30:00.000Z", inputTokens: 200, outputTokens: 50 }),
       update({ startedAt: "2026-07-22T23:30:00.000Z", inputTokens: 900, outputTokens: 100 }),
+    ], now);
+
+    expect(rollup.updateCount).toBe(1);
+    expect(rollup.totalTokens).toBe(250);
+  });
+
+  it("keeps UTC-today rows when local time is ahead of UTC", () => {
+    // Local time is already July 23 in UTC+02, while the UTC day is July 22.
+    const now = new Date("2026-07-23T00:30:00.000+02:00");
+    const rollup = rollupUpdatesToday([
+      update({ startedAt: "2026-07-22T12:00:00.000+02:00", inputTokens: 200, outputTokens: 50 }),
+      update({ startedAt: "2026-07-22T01:30:00.000+02:00", inputTokens: 900, outputTokens: 100 }),
     ], now);
 
     expect(rollup.updateCount).toBe(1);
