@@ -2833,7 +2833,13 @@ export function issueRoutes(
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
-    if (!req.actor.agentId || !req.actor.runId) throw crossIssueInfluenceRunContextError();
+    if (!req.actor.agentId) throw crossIssueInfluenceRunContextError();
+    // Long-running service loops authenticate with an agent API key but do not
+    // originate from a heartbeat issue. With no run there is no source issue
+    // whose cross-issue influence can be counted. A supplied run still flows
+    // through the persisted-run validation below and fails closed if malformed,
+    // missing, or bound to another agent/company.
+    if (!req.actor.runId) return true;
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.

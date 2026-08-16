@@ -250,12 +250,13 @@ export function describeIssueWriteDenial(
         status: 403,
         tone: "boundary",
         boundary: "Heartbeat run context",
-        title: "Cross-issue writes need a run to attribute them to",
+        title: "Cross-issue writes need a valid supplied run",
         description:
-          `Every agent comment and task update is attributed to a heartbeat run so the ` +
-          `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
-          `This request arrived without a valid run, so it could not be contained.`,
-        whoCanAct: `${actor}, once the request carries its own run id.`,
+          `When an agent supplies heartbeat run context for a comment or task update, ` +
+          `the run must exist and belong to the authenticated agent and company so the ` +
+          `cross-issue cap can be counted. This request supplied invalid or mismatched ` +
+          `run context, so it could not be contained.`,
+        whoCanAct: `${actor}, once the request carries its own valid run id.`,
         sanctionedPath:
           `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
           `and retry.`,

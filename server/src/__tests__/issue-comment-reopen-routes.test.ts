@@ -2095,17 +2095,23 @@ describe.sequential("issue comment reopen routes", () => {
     ["update", (app: express.Express) => request(app)
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ title: "cross-issue write" })],
-  ] as const)("rejects cross-issue %s writes without a run header", async (_kind, sendRequest) => {
-    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+  ] as const)("allows run-less agent-key %s writes without counting cross-issue influence", async (_kind, sendRequest) => {
+    const existing = makeIssue("todo");
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...existing,
+      ...patch,
+    }));
     const actor = { ...agentActor("44444444-4444-4444-8444-444444444444"), runId: undefined };
     const res = await sendRequest(await installActor(createApp(), actor));
 
-    expect(res.status).toBe(403);
-    expect(res.body.details).toEqual({ code: "cross_issue_influence_run_context_required" });
-    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+    expect(res.status).toBe(_kind === "comment" ? 201 : 200);
     expect(mockObserveCrossIssueInfluence).not.toHaveBeenCalled();
-    expect(mockIssueService.update).not.toHaveBeenCalled();
-    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    if (_kind === "update") {
+      expect(mockIssueService.update).toHaveBeenCalled();
+    } else {
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    }
   });
 
   it.each(["invalid", "wrong agent", "wrong company"])(

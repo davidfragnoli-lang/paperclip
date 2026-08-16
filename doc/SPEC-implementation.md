@@ -578,13 +578,18 @@ budget gates, and pause gates remain independently enforced. Comment access is
 structurally downstream of issue read access (`issue:comment` is a subset of
 `issue:read`).
 
-Cross-issue writes are contained per heartbeat run. An agent-authored comment
+Cross-issue writes from heartbeat execution are contained per run. An
+agent-authored comment
 may wake the target assignee, including an explicit `resume: true` comment on a
 `done` or `cancelled` issue, but the wake remains agent-class and is subject to
 the normal agent rewake throttle; comment presentation cannot give it human
-wake privileges. Agent issue comments and updates require a persisted heartbeat
-run bound to the authenticated agent and company; missing, invalid, or mismatched
-run context fails closed before mutation. A run may attempt at most 20 cross-issue comments or issue
+wake privileges. When an agent supplies run context for an issue comment or
+update, it must name a persisted heartbeat run bound to the authenticated agent
+and company; malformed, nonexistent, or mismatched run context fails closed
+before mutation. Agent-key service loops without a run have no source issue and
+therefore bypass only this per-run cross-issue counter; normal company, access,
+write-policy, lifecycle, and audit controls still apply. A run may attempt at
+most 20 cross-issue comments or issue
 updates across the shared counter. The server records each attempt with its
 source issue, target issue, run, count, and rollout mode, and fails closed with
 the cap in the error once enforcement is active. Assignee self-comments do not
