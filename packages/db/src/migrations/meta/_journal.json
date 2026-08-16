@@ -1527,6 +1527,13 @@
       "when": 1786820237725,
       "tag": "0219_soft_power_pack",
       "breakpoints": true
+    },
+    {
+      "idx": 220,
+      "version": "7",
+      "when": 1786711898729,
+      "tag": "0220_mushy_jack_murdock",
+      "breakpoints": true
     }
   ]
 }
