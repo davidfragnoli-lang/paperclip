@@ -3964,6 +3964,8 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
       reviewPolicy?: IssueReviewPolicy | null;
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
@@ -4010,7 +4012,14 @@ export function issueRoutes(
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
         return true;
       }
-      if (issue.status === "in_progress") {
+      const lockRunIds = [...new Set([issue.checkoutRunId, issue.executionRunId].filter(
+        (runId): runId is string => Boolean(runId),
+      ))];
+      const lockRuns = await Promise.all(lockRunIds.map((runId) => heartbeat.getRun(runId)));
+      const hasLiveRunLock = lockRuns.some(
+        (run) => run && !["succeeded", "interrupted", "failed", "cancelled", "timed_out"].includes(run.status),
+      );
+      if (issue.status === "in_progress" && hasLiveRunLock) {
         // Run/checkout ownership stays assignee-scoped even though writes are
         // open, so this lock clears on its own — the copy routes to comments.
         return denyIssueWrite(req, res, issue, "issue_write_assignee_run_lock", {

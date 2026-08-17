@@ -5817,6 +5817,110 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
+  it.each(["done", "cancelled"] as const)(
+    "checkout rejects terminal status '%s' even when the caller includes it in expectedStatuses",
+    async (status) => {
+      const companyId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      const agentId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "TerminalCheckoutCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const issueId = randomUUID();
+      const terminalAt = new Date("2026-08-16T22:11:16.757Z");
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Terminal ${status} issue`,
+        status,
+        priority: "high",
+        assigneeAgentId: agentId,
+        completedAt: status === "done" ? terminalAt : null,
+        cancelledAt: status === "cancelled" ? terminalAt : null,
+      });
+
+      await expect(svc.checkout(issueId, agentId, [status], randomUUID())).rejects.toMatchObject({
+        status: 409,
+        details: {
+          code: "issue_checkout_terminal_status",
+          issueId,
+          status,
+        },
+      });
+
+      const row = await db
+        .select({
+          status: issues.status,
+          completedAt: issues.completedAt,
+          cancelledAt: issues.cancelledAt,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status,
+        completedAt: status === "done" ? terminalAt : null,
+        cancelledAt: status === "cancelled" ? terminalAt : null,
+        checkoutRunId: null,
+      });
+    },
+  );
+
+  it("checkout clears stale terminal timestamps when claiming a non-terminal issue", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TimestampCleanupCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Non-terminal issue with stale terminal timestamps",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      completedAt: new Date("2026-08-16T21:00:00.000Z"),
+      cancelledAt: new Date("2026-08-16T22:00:00.000Z"),
+    });
+
+    const checkedOut = await svc.checkout(issueId, agentId, ["todo"], null);
+
+    expect(checkedOut).toMatchObject({
+      status: "in_progress",
+      completedAt: null,
+      cancelledAt: null,
+    });
+  });
+
   it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {
     // Regression for PR #2482 checkout-adoption review finding: any adoption
     // helper that re-locks an existing in_progress issue (e.g. when the prior

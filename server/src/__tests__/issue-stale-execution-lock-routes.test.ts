@@ -410,6 +410,51 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(checkoutActivity).toHaveLength(0);
   });
 
+  it.each(["done", "cancelled"] as const)(
+    "returns a typed 409 when checkout names terminal status '%s' in expectedStatuses",
+    async (status) => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const issueId = randomUUID();
+      const terminalAt = new Date("2026-08-16T22:11:16.757Z");
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Terminal ${status} checkout target`,
+        status,
+        priority: "high",
+        assigneeAgentId: agentId,
+        completedAt: status === "done" ? terminalAt : null,
+        cancelledAt: status === "cancelled" ? terminalAt : null,
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: [status] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body).toMatchObject({
+        error: "Issue checkout conflict",
+        details: { code: "issue_checkout_terminal_status", issueId, status },
+      });
+      const row = await db
+        .select({
+          status: issues.status,
+          completedAt: issues.completedAt,
+          cancelledAt: issues.cancelledAt,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status,
+        completedAt: status === "done" ? terminalAt : null,
+        cancelledAt: status === "cancelled" ? terminalAt : null,
+        checkoutRunId: null,
+      });
+    },
+  );
+
   it("restricts admin force-release to board users with company access and writes an audit event", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
