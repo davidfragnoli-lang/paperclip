@@ -110,7 +110,9 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    // Generic timer heartbeats are valid runs but do not originate from an
+    // issue. With no source issue there is no cross-issue influence to count.
+    if (!sourceIssueId) return null;
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
