@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -73,13 +74,14 @@ describe("TaskMessageScroller", () => {
   /** Set scrollTop and fire a scroll event, like a user or the browser would. */
   async function scrollTo(el: HTMLElement, top: number) {
     el.scrollTop = top;
-    el.dispatchEvent(new Event("scroll", { bubbles: true }));
-    await flushEvents();
+    await dispatch(el, new Event("scroll", { bubbles: true }));
   }
 
   async function dispatch(el: HTMLElement, event: Event) {
-    el.dispatchEvent(event);
-    await flushEvents();
+    await act(async () => {
+      el.dispatchEvent(event);
+      await flushEvents();
+    });
   }
 
   beforeEach(() => {
