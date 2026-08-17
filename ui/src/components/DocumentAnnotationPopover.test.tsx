@@ -6,6 +6,9 @@ import type { DocumentAnnotationThreadWithComments } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DocumentAnnotationPopover } from "./DocumentAnnotationPopover";
 
+// Required for `act` to flush passive effects rather than warn.
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
 const mutations = vi.hoisted(() => ({
   create: vi.fn(),
   reply: vi.fn(),
@@ -88,6 +91,13 @@ describe("DocumentAnnotationPopover", () => {
       ...overrides,
     };
     props.containerRef.current = container;
+    // `act`, so the passive effects are flushed before this returns. Waiting on
+    // the popover element alone is not enough: the element is in the DOM as
+    // soon as React commits, while the effect that registers the document-level
+    // keydown/pointerdown listeners runs afterwards. A test that dispatches in
+    // that gap loses the event outright — and a lost event cannot be recovered
+    // by retrying the assertion, which is why this is fixed here and not at the
+    // call site.
     await act(async () => {
       root.render(<DocumentAnnotationPopover {...props} />);
     });
@@ -116,10 +126,14 @@ describe("DocumentAnnotationPopover", () => {
 
   it("dismisses on Escape and outside pointer down", async () => {
     const first = await render();
+    // What makes the dispatch safe is `render` flushing effects, not the waits
+    // below: an event fired before the listener exists is gone, and no amount of
+    // retrying an assertion brings it back. These waits cover the smaller race
+    // that remains — the handler running before React commits the state change.
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    expect(first.onClose).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(first.onClose).toHaveBeenCalledTimes(1));
     document.body.dispatchEvent(new Event("pointerdown", { bubbles: true }));
-    expect(first.onClose).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(first.onClose).toHaveBeenCalledTimes(2));
   });
 
   it("replies to and resolves a focused thread", async () => {

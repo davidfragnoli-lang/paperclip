@@ -286,7 +286,7 @@ export async function findAdoptableLocalService(input: {
   return record;
 }
 
-async function readProcessGroupId(pid: number) {
+export async function readLocalServiceProcessGroupId(pid: number) {
   if (process.platform === "win32") return null;
   try {
     const { stdout } = await execFileAsync("ps", ["-o", "pgid=", "-p", String(pid)]);
@@ -294,6 +294,39 @@ async function readProcessGroupId(pid: number) {
     return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
   } catch {
     return null;
+  }
+}
+
+export async function isLocalServiceProcessOwnedBy(pid: number, ownerProcessId: number) {
+  if (pid === ownerProcessId) return true;
+  if (process.platform !== "win32") {
+    return (await readLocalServiceProcessGroupId(pid)) === ownerProcessId;
+  }
+
+  try {
+    const script = [
+      `$currentProcessId = ${pid}`,
+      "while ($currentProcessId -gt 0) {",
+      "  $process = Get-CimInstance Win32_Process -Filter \"ProcessId = $currentProcessId\" -ErrorAction SilentlyContinue",
+      "  if ($null -eq $process) { break }",
+      "  $parentProcessId = [int]$process.ParentProcessId",
+      "  Write-Output $parentProcessId",
+      "  if ($parentProcessId -eq $currentProcessId) { break }",
+      "  $currentProcessId = $parentProcessId",
+      "}",
+    ].join("\n");
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      script,
+    ]);
+    return stdout
+      .split(/\r?\n/)
+      .map((line) => Number.parseInt(line.trim(), 10))
+      .some((ancestorPid) => ancestorPid === ownerProcessId);
+  } catch {
+    return false;
   }
 }
 
@@ -318,8 +351,8 @@ async function adoptLocalServiceFromPortOwner(input: {
     }
   }
 
-  const processGroupId = await readProcessGroupId(ownerPid);
-  const pid = ownerPid;
+  const processGroupId = await readLocalServiceProcessGroupId(ownerPid);
+  const pid = processGroupId && isPidAlive(processGroupId) ? processGroupId : ownerPid;
   const now = new Date().toISOString();
   const record: LocalServiceRegistryRecord = {
     version: 1,
@@ -407,21 +440,41 @@ export async function terminateLocalService(
 }
 
 export async function readLocalServicePortOwner(port: number) {
-  if (!Number.isInteger(port) || port <= 0 || process.platform === "win32") return null;
-  const executables = process.platform === "darwin" ? ["lsof", "/usr/sbin/lsof"] : ["lsof"];
-  for (const executable of executables) {
-    try {
-      const { stdout } = await execFileAsync(executable, ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
-      const firstPid = stdout
-        .split("\n")
-        .map((line) => Number.parseInt(line.trim(), 10))
-        .find((value) => Number.isInteger(value) && value > 0);
-      return firstPid ?? null;
-    } catch {
-      // macOS installs lsof in /usr/sbin, which is not always present in agent PATHs.
+  if (!Number.isInteger(port) || port <= 0) return null;
+  try {
+    if (process.platform === "win32") {
+      const { stdout } = await execFileAsync("netstat", ["-ano", "-p", "tcp"]);
+      for (const line of stdout.split(/\r?\n/)) {
+        const columns = line.trim().split(/\s+/);
+        if (columns.length < 5 || columns[0]?.toUpperCase() !== "TCP") continue;
+        const localAddress = columns[1] ?? "";
+        const separatorIndex = localAddress.lastIndexOf(":");
+        const localPort = Number.parseInt(localAddress.slice(separatorIndex + 1), 10);
+        const state = columns.at(-2)?.toUpperCase();
+        const pid = Number.parseInt(columns.at(-1) ?? "", 10);
+        if (localPort === port && state === "LISTENING" && Number.isInteger(pid) && pid > 0) {
+          return pid;
+        }
+      }
+      return null;
     }
+    const executables = process.platform === "darwin" ? ["lsof", "/usr/sbin/lsof"] : ["lsof"];
+    for (const executable of executables) {
+      try {
+        const { stdout } = await execFileAsync(executable, ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
+        const firstPid = stdout
+          .split("\n")
+          .map((line) => Number.parseInt(line.trim(), 10))
+          .find((value) => Number.isInteger(value) && value > 0);
+        return firstPid ?? null;
+      } catch {
+        // macOS installs lsof in /usr/sbin, which is not always present in agent PATHs.
+      }
+    }
+    return null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 export async function readLocalServiceProcessCwd(pid: number) {
