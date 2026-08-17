@@ -63,7 +63,9 @@ function registerRouteMocks() {
     heartbeatService: () => ({
       wakeup: vi.fn(async () => undefined),
       reportRunActivity: vi.fn(async () => undefined),
-      getRun: vi.fn(async () => null),
+      getRun: vi.fn(async (runId: string) =>
+        runId === ownerRunId ? { id: ownerRunId, status: "running" } : null,
+      ),
       getActiveRunForAgent: vi.fn(async () => null),
       cancelRun: vi.fn(async () => null),
     }),
@@ -95,6 +97,8 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     identifier: "PAP-2265",
     title: "External object routes",
     executionWorkspaceId: null,
+    checkoutRunId: ownerRunId,
+    executionRunId: ownerRunId,
     ...overrides,
   };
 }
