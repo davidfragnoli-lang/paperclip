@@ -474,6 +474,114 @@ describe("classifyAdapterFailureForRecovery", () => {
     })).toBeNull();
   });
 
+  it("parses the Codex quota grammar with ordinal day, no timezone (defaults to UTC)", () => {
+    const now = new Date("2026-08-17T17:58:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 20th, 2026 6:54 AM.",
+      resultJson: null,
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-08-20T06:54:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it("still parses the Claude weekly-limit grammar (non-regression control)", () => {
+    const now = new Date("2026-07-10T12:00:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: "You've hit your weekly limit. Your limit resets Jul 14 at 3:00pm (America/New_York).",
+      resultJson: null,
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-07-14T19:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it("returns parsedResetTime: false for unrecognised quota grammars (negative control)", () => {
+    const now = new Date("2026-08-17T18:00:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "You've hit your usage limit. Please wait until quota refreshes.",
+      resultJson: null,
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
+      parsedResetTime: false,
+    });
+  });
+
+  it("applies multiplicative backoff for consecutive unparsed quota failures", () => {
+    const now = new Date("2026-08-17T18:00:00.000Z");
+    const run = {
+      errorCode: "provider_quota" as const,
+      error: "You've hit your usage limit. Please wait.",
+      resultJson: null,
+    };
+
+    const c0 = classifyAdapterFailureForRecovery(run, now, { consecutiveUnparsedQuotaFailures: 0 });
+    const c1 = classifyAdapterFailureForRecovery(run, now, { consecutiveUnparsedQuotaFailures: 1 });
+    const c2 = classifyAdapterFailureForRecovery(run, now, { consecutiveUnparsedQuotaFailures: 2 });
+    const c3 = classifyAdapterFailureForRecovery(run, now, { consecutiveUnparsedQuotaFailures: 3 });
+
+    expect(c0).toMatchObject({ kind: "provider_quota", parsedResetTime: false });
+    expect(c1).toMatchObject({ kind: "provider_quota", parsedResetTime: false });
+    expect(c2).toMatchObject({ kind: "provider_quota", parsedResetTime: false });
+    expect(c3).toMatchObject({ kind: "provider_quota", parsedResetTime: false });
+
+    const retryAt0 = (c0 as { retryAt: Date }).retryAt.getTime();
+    const retryAt1 = (c1 as { retryAt: Date }).retryAt.getTime();
+    const retryAt2 = (c2 as { retryAt: Date }).retryAt.getTime();
+    const retryAt3 = (c3 as { retryAt: Date }).retryAt.getTime();
+
+    expect(retryAt0).toBe(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS);
+    expect(retryAt1).toBe(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS * 2);
+    expect(retryAt2).toBe(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS * 4);
+    expect(retryAt3).toBe(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS * 8);
+  });
+
+  it("caps multiplicative backoff at 2^4 (16h)", () => {
+    const now = new Date("2026-08-17T18:00:00.000Z");
+    const c4 = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "You've hit your usage limit.",
+      resultJson: null,
+    }, now, { consecutiveUnparsedQuotaFailures: 4 });
+    const c10 = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "You've hit your usage limit.",
+      resultJson: null,
+    }, now, { consecutiveUnparsedQuotaFailures: 10 });
+
+    expect((c4 as { retryAt: Date }).retryAt.getTime())
+      .toBe(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS * 16);
+    expect((c10 as { retryAt: Date }).retryAt.getTime())
+      .toBe(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS * 16);
+  });
+
+  it("does not apply multiplicative backoff when reset time is parsed", () => {
+    const now = new Date("2026-08-17T17:58:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 20th, 2026 6:54 AM.",
+      resultJson: null,
+    }, now, { consecutiveUnparsedQuotaFailures: 5 });
+
+    expect(classification).toMatchObject({
+      kind: "provider_quota",
+      parsedResetTime: true,
+      retryAt: new Date("2026-08-20T06:54:00.000Z"),
+    });
+  });
+
   it("source-derives emitted failure codes and requires classification or explicit exclusion", () => {
     const repoRoot = fileURLToPath(new URL("../../../../", import.meta.url));
     const packageSourceRoots = discoverPackageSourceRoots(path.join(repoRoot, "packages"));
