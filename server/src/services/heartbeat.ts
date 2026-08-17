@@ -20991,10 +20991,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+      const strandedMonitors = await reconcileStrandedTriggeredIssueMonitors(now);
 
       return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
+        checked: checked + issueMonitors.checked + strandedMonitors.checked,
+        enqueued: enqueued + issueMonitors.triggered + strandedMonitors.rearmed,
         skipped: skipped + issueMonitors.skipped,
       };
     },

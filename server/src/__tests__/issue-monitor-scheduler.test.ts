@@ -591,4 +591,115 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(JSON.stringify(activity.map((row) => row.details))).not.toContain("provider.example");
     expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).not.toHaveProperty("externalRef");
   });
+
+  it("reconciles a stranded triggered monitor via tickTimers (not the reconciler directly)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    const triggeredAt = new Date("2026-04-11T12:00:00.000Z");
+    const tickAt = new Date("2026-04-11T12:10:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Stranded Bot",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", ""],
+        cwd: process.cwd(),
+      },
+      runtimeConfig: {
+        heartbeat: {
+          enabled: false,
+          wakeOnDemand: true,
+        },
+      },
+      permissions: {},
+    });
+    seededAgentIds.add(agentId);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stranded monitor issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          nextCheckAt: triggeredAt.toISOString(),
+          notes: "Check deploy",
+          scheduledBy: "assignee",
+        },
+      },
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: triggeredAt.toISOString(),
+          attemptCount: 1,
+          notes: "Check deploy",
+          scheduledBy: "assignee",
+          serviceName: null,
+          externalRef: null,
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: null,
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorNextCheckAt: null,
+      monitorAttemptCount: 1,
+      monitorLastTriggeredAt: triggeredAt,
+      monitorNotes: "Check deploy",
+      monitorScheduledBy: "assignee",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.enqueued).toBeGreaterThanOrEqual(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).not.toBeNull();
+    expect(issue.monitorNextCheckAt!.getTime()).toBeGreaterThanOrEqual(tickAt.getTime());
+
+    const state = parseIssueExecutionState(issue.executionState)?.monitor;
+    expect(state?.status).toBe("scheduled");
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_rearmed");
+  });
 });
