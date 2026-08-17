@@ -1244,6 +1244,36 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("allows an agent to cancel a blocked issue whose blocker is unresolved", async () => {
+    const blockedIssue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(blockedIssue);
+    mockIssueService.getByIdForUpdate.mockResolvedValue(blockedIssue);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: blockedIssue.id,
+      blockerIssueIds: ["33333333-3333-4333-8333-333333333333"],
+      unresolvedBlockerIssueIds: ["33333333-3333-4333-8333-333333333333"],
+      unresolvedBlockerCount: 1,
+      allBlockersDone: false,
+      isDependencyReady: false,
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...blockedIssue,
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch(`/api/issues/${blockedIssue.id}`)
+      .send({ status: "cancelled", comment: "Superseded by the active implementation lane." });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      blockedIssue.id,
+      expect.objectContaining({ status: "cancelled" }),
+      expect.anything(),
+    );
+    expect(mockIssueService.getDependencyReadiness).not.toHaveBeenCalled();
+  });
+
   it("does not implicitly reopen a blocked issue via PATCH when the same request wires blockers", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
@@ -2095,17 +2125,23 @@ describe.sequential("issue comment reopen routes", () => {
     ["update", (app: express.Express) => request(app)
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ title: "cross-issue write" })],
-  ] as const)("rejects cross-issue %s writes without a run header", async (_kind, sendRequest) => {
-    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+  ] as const)("allows run-less agent-key %s writes without counting cross-issue influence", async (_kind, sendRequest) => {
+    const existing = makeIssue("todo");
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...existing,
+      ...patch,
+    }));
     const actor = { ...agentActor("44444444-4444-4444-8444-444444444444"), runId: undefined };
     const res = await sendRequest(await installActor(createApp(), actor));
 
-    expect(res.status).toBe(403);
-    expect(res.body.details).toEqual({ code: "cross_issue_influence_run_context_required" });
-    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+    expect(res.status).toBe(_kind === "comment" ? 201 : 200);
     expect(mockObserveCrossIssueInfluence).not.toHaveBeenCalled();
-    expect(mockIssueService.update).not.toHaveBeenCalled();
-    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    if (_kind === "update") {
+      expect(mockIssueService.update).toHaveBeenCalled();
+    } else {
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    }
   });
 
   it.each(["invalid", "wrong agent", "wrong company"])(
@@ -2600,6 +2636,14 @@ describe.sequential("issue comment reopen routes", () => {
       status: "done",
       completedAt: new Date(),
       updatedAt: new Date(),
+      autoPrunedTerminalBlockerEffect: {
+        wakeTargets: [{
+          id: "dependent-1",
+          assigneeAgentId: dependentAgentId,
+          blockerIssueIds: [issue.id],
+          resolvedBlockerIssueId: issue.id,
+        }],
+      },
       _tx: tx,
     }));
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
@@ -2623,7 +2667,6 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockIssueService.listWakeableBlockedDependents).toHaveBeenCalledWith(issue.id);
     await waitForWakeup(() => {
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         dependentAgentId,
