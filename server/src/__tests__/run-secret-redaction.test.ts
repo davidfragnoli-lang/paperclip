@@ -75,4 +75,34 @@ describe("registered run secret redaction", () => {
     expect(result.createdAt).toBeInstanceOf(Date);
     expect(result.createdAt.toISOString()).toBe("2026-08-06T12:00:00.000Z");
   });
+
+  it("preserves nested Dates and other non-plain objects while redacting strings", () => {
+    const createdAt = new Date("2026-08-06T10:00:03.109Z");
+    const map = new Map([["secret", secret]]);
+    const set = new Set([secret]);
+    const bytes = Buffer.from(secret);
+    const result = redactRegisteredSecretValues({
+      comment: {
+        createdAt,
+        body: `agent pasted ${secret}`,
+      },
+      map,
+      set,
+      bytes,
+    }, [secret]);
+
+    expect(result).toEqual({
+      comment: {
+        createdAt,
+        body: `agent pasted ${REDACTED_EVENT_VALUE}`,
+      },
+      map,
+      set,
+      bytes,
+    });
+    expect(result.comment.createdAt).toBe(createdAt);
+    expect(result.map).toBe(map);
+    expect(result.set).toBe(set);
+    expect(result.bytes).toBe(bytes);
+  });
 });
