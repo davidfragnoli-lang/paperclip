@@ -1,11 +1,12 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statfsSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
 export type DatabaseBackupHealthWarningCode =
   | "database_backup_check_failed"
   | "database_backup_last_failure"
   | "database_backup_missing"
-  | "database_backup_stale";
+  | "database_backup_stale"
+  | "host_disk_capacity_low";
 
 export type DatabaseBackupHealthWarning = {
   code: DatabaseBackupHealthWarningCode;
@@ -29,6 +30,11 @@ export type DatabaseBackupHealthStatus = {
     mtime: string;
     message: string;
   } | null;
+  hostCapacity: {
+    totalBytes: number;
+    availableBytes: number;
+    availablePercent: number;
+  } | null;
   warnings: DatabaseBackupHealthWarning[];
 };
 
@@ -38,6 +44,8 @@ export type InspectDatabaseBackupHealthOptions = {
   maxAgeHours: number;
   alertFile?: string;
   alertFiles?: string[];
+  minimumFreeBytes?: number;
+  minimumFreePercent?: number;
   now?: Date;
 };
 
@@ -111,10 +119,26 @@ export function inspectDatabaseBackupHealth(
 
   let latestBackup: DatabaseBackupHealthStatus["latestBackup"] = null;
   let lastFailure: DatabaseBackupHealthStatus["lastFailure"] = null;
+  let hostCapacity: DatabaseBackupHealthStatus["hostCapacity"] = null;
 
   try {
     latestBackup = findLatestBackup(opts.backupDir, now.getTime());
     lastFailure = readLastFailure(alertFileCandidates(opts));
+    const filesystem = statfsSync(opts.backupDir);
+    const totalBytes = filesystem.blocks * filesystem.bsize;
+    const availableBytes = filesystem.bavail * filesystem.bsize;
+    const availablePercent = totalBytes > 0 ? Math.round((availableBytes / totalBytes) * 1_000) / 10 : 0;
+    hostCapacity = { totalBytes, availableBytes, availablePercent };
+
+    if (
+      availableBytes < (opts.minimumFreeBytes ?? 50 * 1024 ** 3) ||
+      availablePercent < (opts.minimumFreePercent ?? 5)
+    ) {
+      warnings.push({
+        code: "host_disk_capacity_low",
+        message: `Host volume containing ${opts.backupDir} has ${availablePercent}% free (${availableBytes} bytes available).`,
+      });
+    }
 
     if (!latestBackup) {
       warnings.push({
@@ -148,6 +172,7 @@ export function inspectDatabaseBackupHealth(
     maxAgeHours,
     latestBackup,
     lastFailure,
+    hostCapacity,
     warnings,
   };
 }
