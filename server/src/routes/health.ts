@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { Router } from "express";
+import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import { and, count, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, instanceUserRoles, invites } from "@paperclipai/db";
@@ -46,6 +46,7 @@ function redactedDatabaseBackupWarning(warning: DatabaseBackupHealthWarning): Da
     database_backup_last_failure: "Database backup failure marker is present.",
     database_backup_missing: "No recent database backup was found.",
     database_backup_stale: "Latest database backup is stale.",
+    host_disk_capacity_low: "Host disk capacity is critically low.",
   };
   return {
     code: warning.code,
@@ -91,6 +92,40 @@ export function healthRoutes(
   },
 ) {
   const router = Router();
+
+  const requireRestartDrainActor = (req: Request) => {
+    const actorType = "actor" in req ? req.actor?.type : null;
+    if (opts.deploymentMode === "authenticated" && actorType !== "board" && actorType !== "agent") {
+      return false;
+    }
+    return true;
+  };
+
+  router.post("/restart-drain/quiesce", async (req, res) => {
+    if (!requireRestartDrainActor(req)) {
+      res.status(403).json({ error: "runtime_restart_access_required" });
+      return;
+    }
+    const quiesce = req.app.locals.paperclipRestartDrainQuiesce as (() => Promise<unknown>) | undefined;
+    if (!quiesce) {
+      res.status(503).json({ error: "heartbeat_scheduler_unavailable" });
+      return;
+    }
+    res.json(await quiesce());
+  });
+
+  router.post("/restart-drain/resume", async (req, res) => {
+    if (!requireRestartDrainActor(req)) {
+      res.status(403).json({ error: "runtime_restart_access_required" });
+      return;
+    }
+    const resume = req.app.locals.paperclipRestartDrainResume as (() => unknown) | undefined;
+    if (!resume) {
+      res.status(503).json({ error: "heartbeat_scheduler_unavailable" });
+      return;
+    }
+    res.json(resume());
+  });
 
   router.post("/dev-server/restart", async (req, res) => {
     const actorType = "actor" in req ? req.actor?.type : null;
