@@ -25,6 +25,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { agentService } from "../services/agents.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -138,6 +139,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
+    agentPausedAt?: Date | null;
     issueStatus?: "in_progress" | "in_review";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
@@ -170,6 +172,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       name: "Monitor Bot",
       role: "engineer",
       status: input?.agentStatus ?? "active",
+      pausedAt: input?.agentPausedAt ?? null,
       adapterType: "process",
       adapterConfig: {
         command: process.execPath,
@@ -334,8 +337,11 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, participantAgentId));
-    expect(participantRuns).toHaveLength(1);
-    expect(participantRuns[0]?.errorCode).not.toBe("issue_assignee_changed");
+    const reviewRecoveryRuns = participantRuns.filter((run) => (
+      (run.contextSnapshot as Record<string, unknown> | null)?.source === "issue.execution_review_recovery"
+    ));
+    expect(reviewRecoveryRuns).toHaveLength(1);
+    expect(participantRuns.every((run) => run.errorCode !== "issue_assignee_changed")).toBe(true);
   });
 
   it("lets the board trigger a scheduled issue monitor immediately", async () => {
@@ -384,28 +390,97 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     });
   });
 
-  it("clears due monitors that cannot be dispatched and records a skip", async () => {
-    const { issueId } = await seedFixture({ agentStatus: "paused" });
+  it("suspends a due monitor while paused, shifts its clock on resume, and then delivers", async () => {
+    const { issueId, agentId } = await seedFixture({
+      agentStatus: "paused",
+      agentPausedAt: new Date("2026-04-11T12:00:00.000Z"),
+      monitor: {
+        maxAttempts: 1,
+        timeoutAt: "2026-04-11T12:35:00.000Z",
+      },
+    });
     const heartbeat = heartbeatService(db);
-    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+    const tickAt = new Date("2026-04-11T12:40:00.000Z");
 
     const result = await heartbeat.tickTimers(tickAt);
 
     expect(result.skipped).toBe(1);
 
-    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
-    expect(issue.monitorNextCheckAt).toBeNull();
-    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
-      status: "cleared",
-      clearReason: "dispatch_skipped",
+    const deferredIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(deferredIssue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:30:00.000Z");
+    expect(deferredIssue.monitorAttemptCount).toBe(0);
+    expect(parseIssueExecutionState(deferredIssue.executionState)?.monitor).toMatchObject({
+      status: "scheduled",
+      attemptCount: 0,
+      maxAttempts: 1,
     });
 
-    const activity = await db
+    const deferredActivity = await db
       .select()
       .from(activityLog)
-      .where(eq(activityLog.entityId, issueId))
-      .then((rows) => rows.map((row) => row.action));
-    expect(activity).toContain("issue.monitor_skipped");
+      .where(eq(activityLog.entityId, issueId));
+    expect(deferredActivity.map((row) => row.action)).toContain("issue.monitor_deferred_agent_not_invokable");
+    expect(parseIssueExecutionState(deferredIssue.executionState)?.monitor?.clearReason).toBeNull();
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
+
+    await agentService(db).resume(agentId, { now: new Date("2026-04-11T13:00:00.000Z") });
+
+    const resumedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(resumedIssue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T13:30:00.000Z");
+    expect(normalizeIssueExecutionPolicy(resumedIssue.executionPolicy)?.monitor?.timeoutAt).toBe("2026-04-11T13:35:00.000Z");
+
+    const delivered = await heartbeat.tickTimers(new Date("2026-04-11T13:31:00.000Z"));
+
+    expect(delivered.enqueued).toBe(1);
+    const deliveredIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(deliveredIssue.monitorNextCheckAt).toBeNull();
+    expect(deliveredIssue.monitorAttemptCount).toBe(1);
+    expect(parseIssueExecutionState(deliveredIssue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      attemptCount: 1,
+      maxAttempts: 1,
+    });
+  });
+
+  it("bounds automated non-invokable dispatch while preserving attempted volume and loud user failure", async () => {
+    const { agentId } = await seedFixture({
+      agentStatus: "paused",
+      agentPausedAt: new Date("2026-04-11T12:00:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const results = await Promise.allSettled(Array.from({ length: 30 }, async () => {
+      return heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "bounded-refusal-test",
+        requestedByActorType: "system",
+        requestedByActorId: "test-scheduler",
+      });
+    }));
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "fulfilled" && result.value === null)).toHaveLength(29);
+
+    const automatedRefusals = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(automatedRefusals).toHaveLength(1);
+    expect(automatedRefusals[0]).toMatchObject({
+      status: "skipped",
+      reason: "agent.not_invokable",
+      coalescedCount: 29,
+    });
+    expect(automatedRefusals.reduce((total, row) => total + 1 + row.coalescedCount, 0)).toBe(30);
+
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "user-wake-test",
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    })).rejects.toMatchObject({ status: 409 });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
   });
 
   it("clears exhausted monitors and queues bounded owner recovery instead of another due check", async () => {
