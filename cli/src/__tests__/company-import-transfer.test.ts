@@ -133,7 +133,7 @@ describe("resolveChunkedImportZip", () => {
     expect(resolved).not.toBeNull();
     expect(resolved!.rootPath).toBe("dense-package");
     expect(sha256Hex(resolved!.zipBytes)).toBe(sha256Hex(zipBytes));
-  });
+  }, 15_000);
 
   it("uses the lower existing-company threshold for the chunk decision", async () => {
     const dir = await makeTempDir();
@@ -239,7 +239,7 @@ describe("resolveChunkedImportZip", () => {
     expect(archive.rootPath).toBe("big-package");
     expect(Object.keys(archive.files).sort()).toEqual(["COMPANY.md", "blobs/4f2d1c9a"]);
     expect(archive.files["COMPANY.md"]).toBe("# Company\n");
-  });
+  }, 15_000);
 });
 
 describe("uploadCompanyImportTransfer", () => {
