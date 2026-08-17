@@ -5,6 +5,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { signalProcessTree } from "@paperclipai/adapter-utils/server-utils";
 
 const execFileAsync = promisify(execFile);
 
@@ -345,7 +346,7 @@ async function adoptLocalServiceFromPortOwner(input: {
 
   if (input.cwd) {
     const ownerCwd = await readLocalServiceProcessCwd(ownerPid);
-    if (!ownerCwd || !(await isLocalServiceProcessInWorkspace(ownerCwd, input.cwd))) {
+    if (!(await isLocalServiceRegistryCwdCompatible(ownerCwd, input.cwd))) {
       return null;
     }
   }
@@ -401,22 +402,23 @@ export async function terminateLocalService(
 ) {
   const signal = opts?.signal ?? "SIGTERM";
   const targetProcessGroup = process.platform !== "win32" && record.processGroupId && record.processGroupId > 0;
-  try {
-    if (targetProcessGroup) {
-      process.kill(-record.processGroupId!, signal);
-    } else {
-      process.kill(record.pid, signal);
-    }
-  } catch {
-    return;
-  }
+  const retainedDescendantPids = new Set<number>();
+  signalProcessTree(
+    {
+      pid: record.pid,
+      processGroupId: record.processGroupId,
+      retainedDescendantPids,
+    },
+    signal,
+  );
 
   const deadline = Date.now() + (opts?.forceAfterMs ?? 2_000);
   while (Date.now() < deadline) {
     const targetAlive = targetProcessGroup
       ? isProcessGroupAlive(record.processGroupId)
       : isPidAlive(record.pid);
-    if (!targetAlive) {
+    const descendantAlive = Array.from(retainedDescendantPids).some(isPidAlive);
+    if (!targetAlive && !descendantAlive) {
       return;
     }
     await delay(100);
@@ -425,16 +427,16 @@ export async function terminateLocalService(
   const stillAlive = targetProcessGroup
     ? isProcessGroupAlive(record.processGroupId)
     : isPidAlive(record.pid);
-  if (!stillAlive) return;
-  try {
-    if (targetProcessGroup) {
-      process.kill(-record.processGroupId!, "SIGKILL");
-    } else {
-      process.kill(record.pid, "SIGKILL");
-    }
-  } catch {
-    // Ignore cleanup races.
-  }
+  const descendantStillAlive = Array.from(retainedDescendantPids).some(isPidAlive);
+  if (!stillAlive && !descendantStillAlive) return;
+  signalProcessTree(
+    {
+      pid: record.pid,
+      processGroupId: record.processGroupId,
+      retainedDescendantPids,
+    },
+    "SIGKILL",
+  );
 }
 
 export async function readLocalServicePortOwner(port: number) {
@@ -456,15 +458,24 @@ export async function readLocalServicePortOwner(port: number) {
       }
       return null;
     }
-    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
-    const firstPid = stdout
-      .split("\n")
-      .map((line) => Number.parseInt(line.trim(), 10))
-      .find((value) => Number.isInteger(value) && value > 0);
-    return firstPid ?? null;
+    const executables = process.platform === "darwin" ? ["lsof", "/usr/sbin/lsof"] : ["lsof"];
+    for (const executable of executables) {
+      try {
+        const { stdout } = await execFileAsync(executable, ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
+        const firstPid = stdout
+          .split("\n")
+          .map((line) => Number.parseInt(line.trim(), 10))
+          .find((value) => Number.isInteger(value) && value > 0);
+        return firstPid ?? null;
+      } catch {
+        // macOS installs lsof in /usr/sbin, which is not always present in agent PATHs.
+      }
+    }
+    return null;
   } catch {
     return null;
   }
+  return null;
 }
 
 export async function readLocalServiceProcessCwd(pid: number) {
