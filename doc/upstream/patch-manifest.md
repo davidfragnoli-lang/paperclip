@@ -18,6 +18,17 @@ KPI target: manifest size must trend DOWN.
 
 ---
 
+## Upstream PR-ready branches (on `fork` remote)
+
+| Branch | Theme | Files | Status | Cycle |
+|--------|-------|-------|--------|-------|
+| `upstream/vitest-exclude-dist` | Test stabilization — vitest config | 6 | PR-ready, not submitted (GATE) | 2026-08-17 |
+| `upstream/fix-install-store-symlink-unlink` | CLI robustness — symlink safety | 2 | PR-ready, not submitted (GATE) | 2026-08-17 |
+
+**GATE**: Do NOT submit public PRs to paperclipai/paperclip until David gives standing authorization.
+
+---
+
 ## obsolete (14 files)
 
 Files where upstream now has equivalent functionality. Drop on next rebase.
