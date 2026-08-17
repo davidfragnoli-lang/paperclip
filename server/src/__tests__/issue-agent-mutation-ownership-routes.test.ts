@@ -255,6 +255,8 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     parentId: null,
     assigneeAgentId: ownerAgentId,
     assigneeUserId: null,
+    checkoutRunId: ownerRunId,
+    executionRunId: ownerRunId,
     createdByUserId: "board-user",
     identifier: "PAP-1649",
     title: "Owned active issue",
@@ -570,6 +572,10 @@ describe("agent issue mutation checkout ownership", () => {
     });
     mockIssueService.list.mockResolvedValue([makeIssue()]);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockHeartbeatService.getRun.mockReset();
+    mockHeartbeatService.getRun.mockImplementation(async (runId: string) => (
+      runId === ownerRunId ? { id: ownerRunId, status: "running" } : null
+    ));
     mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
       ...makeIssue({
         id: "88888888-8888-4888-8888-888888888888",
@@ -799,6 +805,30 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["no lock pointers", null, null, null],
+    ["a terminal run pointer", ownerRunId, ownerRunId, "cancelled"],
+  ])("allows a peer mutation when an in-progress issue has %s", async (_label, checkoutRunId, executionRunId, runStatus) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId, executionRunId }));
+    if (runStatus) {
+      mockHeartbeatService.getRun.mockResolvedValue({ id: ownerRunId, status: runStatus });
+    }
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ checkoutRunId, executionRunId }),
+      ...patch,
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Repairable issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ title: "Repairable issue" }),
+    );
   });
 
   it("allows mentioned peer agents to post comments without ownership of an active checkout", async () => {

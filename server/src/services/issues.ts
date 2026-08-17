@@ -7997,11 +7997,18 @@ export function issueService(db: Db) {
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
       const issueCompany = await db
-        .select({ companyId: issues.companyId })
+        .select({ companyId: issues.companyId, status: issues.status })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
+      if (issueCompany.status === "done" || issueCompany.status === "cancelled") {
+        throw conflict("Issue checkout conflict", {
+          code: "issue_checkout_terminal_status",
+          issueId: id,
+          status: issueCompany.status,
+        });
+      }
       await assertAssignableAgent(db, issueCompany.companyId, agentId, { kind: "work" });
 
       const now = new Date();
@@ -8055,6 +8062,8 @@ export function issueService(db: Db) {
           checkoutRunId,
           executionRunId: checkoutRunId,
           status: "in_progress",
+          completedAt: null,
+          cancelledAt: null,
           startedAt: now,
           updatedAt: now,
         })
@@ -8062,6 +8071,7 @@ export function issueService(db: Db) {
           and(
             eq(issues.id, id),
             inArray(issues.status, expectedStatuses),
+            notInArray(issues.status, ["done", "cancelled"]),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
           ),
@@ -8087,6 +8097,14 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+
+      if (current.status === "done" || current.status === "cancelled") {
+        throw conflict("Issue checkout conflict", {
+          code: "issue_checkout_terminal_status",
+          issueId: id,
+          status: current.status,
+        });
+      }
 
       if (
         current.assigneeAgentId === agentId &&
@@ -8156,6 +8174,8 @@ export function issueService(db: Db) {
             executionAgentNameKey: null,
             executionLockedAt: now,
             status: "in_progress",
+            completedAt: null,
+            cancelledAt: null,
             updatedAt: now,
           };
           if (current.status !== "in_progress") {
@@ -8168,6 +8188,7 @@ export function issueService(db: Db) {
               and(
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
+                notInArray(issues.status, ["done", "cancelled"]),
                 eq(issues.executionRunId, current.executionRunId),
                 or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
               ),
