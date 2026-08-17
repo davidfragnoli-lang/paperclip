@@ -31,6 +31,7 @@ import type {
   AcpxRemoteManagedHomeResult,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
 import {
+  asBoolean,
   asNumber,
   asString,
   parseObject,
@@ -49,6 +50,11 @@ import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRootDir = path.resolve(moduleDir, "../..");
 const MIN_ACP_NODE_VERSION = "22.13.0";
+// Recovery and long-running verification paths in Paperclip can exceed short ACP
+// stream gaps; keep the local lane tolerant of longer quiet periods while
+// preserving a bounded retry envelope.
+const DEFAULT_CODEX_ACP_STREAM_IDLE_TIMEOUT_MS = 45 * 60 * 1000;
+const DEFAULT_CODEX_ACP_STREAM_IDLE_MAX_RETRIES = 2;
 
 export type CodexExecutionEngine = "cli" | "acp";
 
@@ -153,9 +159,18 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
   const normalizedModel = normalizeCodexModel(
     typeof config.model === "string" ? config.model : "",
   );
+  const bypassApprovalsAndSandbox = asBoolean(
+    config.dangerouslyBypassApprovalsAndSandbox,
+    asBoolean(config.dangerouslyBypassSandbox, false),
+  );
+  const configuredEnv = parseObject(config.env);
+  const env = bypassApprovalsAndSandbox && typeof configuredEnv.INITIAL_AGENT_MODE !== "string"
+    ? { ...configuredEnv, INITIAL_AGENT_MODE: "agent-full-access" }
+    : configuredEnv;
 
   return {
     ...config,
+    env,
     agent: "codex",
     mode,
     permissionMode,
