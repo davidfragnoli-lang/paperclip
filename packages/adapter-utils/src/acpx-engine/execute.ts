@@ -113,8 +113,8 @@ interface ChildStderrState {
 
 function routeChildStderr(state: ChildStderrState, chunk: string) {
   if (state.logPath) {
-    fsSync.mkdirSync(path.dirname(state.logPath), { recursive: true });
-    fsSync.appendFileSync(state.logPath, chunk);
+    fsSync.mkdirSync(path.dirname(state.logPath), { recursive: true, mode: 0o700 });
+    fsSync.appendFileSync(state.logPath, chunk, { mode: 0o600 });
   }
   const combined = state.pendingLiveLine + chunk;
   const lastNewline = combined.lastIndexOf("\n");
@@ -654,7 +654,7 @@ async function pathExists(candidate: string): Promise<boolean> {
 }
 
 async function ensureParentDir(target: string): Promise<void> {
-  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
 }
 
 async function writeFileAtomically(input: {
@@ -730,7 +730,7 @@ async function prepareManagedCodexHome(input: {
   const { sourceHome, targetHome, onLog } = input;
   if (path.resolve(sourceHome) === path.resolve(targetHome)) return targetHome;
 
-  await fs.mkdir(targetHome, { recursive: true });
+  await fs.mkdir(targetHome, { recursive: true, mode: 0o700 });
 
   const authJson = path.join(sourceHome, "auth.json");
   if (await pathExists(authJson)) await ensureSymlink(path.join(targetHome, "auth.json"), authJson);
@@ -829,7 +829,7 @@ async function prepareClaudeSkillRuntime(input: {
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "claude" });
   const bundleRoot = path.join(input.stateDir, "runtime-skills", "claude", skillSetKey);
   const skillsHome = path.join(bundleRoot, ".claude", "skills");
-  await fs.mkdir(skillsHome, { recursive: true });
+  await fs.mkdir(skillsHome, { recursive: true, mode: 0o700 });
 
   for (const entry of selectedSkills) {
     const target = path.join(skillsHome, entry.runtimeName);
@@ -893,7 +893,7 @@ async function writeManagedCodexSkillsManifest(skillsHome: string, skillNames: I
   await fs.writeFile(
     path.join(skillsHome, PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST),
     `${JSON.stringify({ version: 1, managedSkillNames }, null, 2)}\n`,
-    "utf8",
+    { encoding: "utf8", mode: 0o600 },
   );
 }
 
@@ -983,7 +983,7 @@ async function prepareCodexSkillRuntime(input: {
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "codex" });
   const skillsHome = path.join(effectiveCodexHome, "skills");
-  await fs.mkdir(skillsHome, { recursive: true });
+  await fs.mkdir(skillsHome, { recursive: true, mode: 0o700 });
   // Step 3 — skills.reconcile: nested inside the codex-home seed (step 2), so it
   // emits its own boundary event and span at this call-site. It must NOT add its
   // wall time to the root work sum. The enclosing step 2 wall already covers this
@@ -1055,7 +1055,7 @@ async function prepareGeminiSkillRuntime(input: {
   const { selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "gemini" });
   const skillsHome = resolveGeminiSkillsHome(input.config);
-  await fs.mkdir(skillsHome, { recursive: true });
+  await fs.mkdir(skillsHome, { recursive: true, mode: 0o700 });
 
   const allowedSkillNames = selectedSkills.map((entry) => entry.runtimeName);
   const removedSkills = await removeMaintainerOnlySkillSymlinks(skillsHome, allowedSkillNames);
@@ -1563,7 +1563,7 @@ async function buildRuntime(input: {
   );
   const timeoutSec = timeoutResolution.timeoutSec;
   const stateDir = path.resolve(asString(config.stateDir, "") || defaultStateDir(agent.companyId, agent.id));
-  await fs.mkdir(stateDir, { recursive: true });
+  await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
 
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = { ...buildPaperclipEnv(agent), PAPERCLIP_RUN_ID: runId };

@@ -73,6 +73,25 @@ diff --git a/dist/runtime.js b/dist/runtime.js
 index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..33b5054b2906502d1d4b512bfa259bd2ba5a9f05 100644
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
+@@ -1359,10 +1359,11 @@ var FileSessionStore = class {
+ 		return path.join(this.sessionDir, `${safeSessionId(sessionId)}.json`);
+ 	}
+ 	async ensureDir() {
+-		await fs.mkdir(this.sessionDir, { recursive: true });
++		await fs.mkdir(this.sessionDir, { recursive: true, mode: 0o700 });
+ 	}
+ 	async load(sessionId) {
+ 		await this.ensureDir();
+@@ -1385,8 +1386,9 @@ var FileSessionStore = class {
+ 		const file = this.filePath(record.acpxRecordId);
+ 		const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
+ 		const payload = JSON.stringify(persisted, null, 2);
+-		await fs.writeFile(tempFile, `${payload}\n`, "utf8");
++		await fs.writeFile(tempFile, `${payload}\n`, { encoding: "utf8", mode: 0o600 });
+ 		await fs.rename(tempFile, file);
++		await fs.chmod(file, 0o600).catch(() => {});
+ 	}
+ };
 @@ -744,7 +744,8 @@ var AcpRuntimeManager = class {
  		this.deps = deps;
  	}

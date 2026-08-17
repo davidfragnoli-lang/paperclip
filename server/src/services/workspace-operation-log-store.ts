@@ -53,7 +53,7 @@ function resolveWithin(basePath: string, relativePath: string) {
 function createLocalFileWorkspaceOperationLogStore(basePath: string): WorkspaceOperationLogStore {
   async function ensureDir(relativeDir: string) {
     const dir = resolveWithin(basePath, relativeDir);
-    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   }
 
   async function readFileRange(filePath: string, offset: number, limitBytes: number): Promise<WorkspaceOperationLogReadResult> {
@@ -101,7 +101,7 @@ function createLocalFileWorkspaceOperationLogStore(basePath: string): WorkspaceO
       await ensureDir(relDir);
 
       const absPath = resolveWithin(basePath, relPath);
-      await fs.writeFile(absPath, "", "utf8");
+      await fs.writeFile(absPath, "", { encoding: "utf8", mode: 0o600 });
 
       return { store: "local_file", logRef: relPath };
     },

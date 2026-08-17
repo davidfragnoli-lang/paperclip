@@ -137,7 +137,7 @@ function resolvePiBiller(env: Record<string, string>, provider: string | null): 
 }
 
 async function ensureSessionsDir(): Promise<string> {
-  await fs.mkdir(PAPERCLIP_SESSIONS_DIR, { recursive: true });
+  await fs.mkdir(PAPERCLIP_SESSIONS_DIR, { recursive: true, mode: 0o700 });
   return PAPERCLIP_SESSIONS_DIR;
 }
 
@@ -548,7 +548,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       } else {
         try {
-          await fs.writeFile(sessionPath, "", { flag: "wx" });
+          await fs.writeFile(sessionPath, "", { flag: "wx", mode: 0o600 });
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
             throw err;

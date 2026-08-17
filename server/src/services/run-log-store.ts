@@ -206,7 +206,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
 
   async function ensureDir(relativeDir: string) {
     const dir = resolveWithin(basePath, relativeDir);
-    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   }
 
   async function readLocalRange(
@@ -284,7 +284,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       const relPath = path.join(relDir, `${runId}.ndjson`);
       await ensureDir(relDir);
       const absPath = resolveWithin(basePath, relPath);
-      await fs.writeFile(absPath, "", "utf8");
+      await fs.writeFile(absPath, "", { encoding: "utf8", mode: 0o600 });
       await retireInflightMirror(relPath);
       return { store: "local_file", logRef: relPath };
     },
