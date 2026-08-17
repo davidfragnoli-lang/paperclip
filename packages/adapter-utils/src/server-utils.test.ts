@@ -25,8 +25,41 @@ import {
   stringifyPaperclipWakePayload,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+  LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+
+it("persists a local child completion envelope before the tracked wrapper exits", async () => {
+  const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-child-completion-"));
+  try {
+    const result = await runChildProcess(
+      "durable-completion-run",
+      process.execPath,
+      ["-e", "process.stdout.write('done'); process.exit(0)"],
+      {
+        cwd: process.cwd(),
+        env: { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir },
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+    const envelope = JSON.parse(await fs.readFile(
+      path.join(scratchDir, LOCAL_CHILD_COMPLETION_ENVELOPE_FILENAME),
+      "utf8",
+    ));
+    expect(result.exitCode).toBe(0);
+    expect(envelope).toMatchObject({
+      version: 1,
+      runId: "durable-completion-run",
+      exitCode: 0,
+      signal: null,
+    });
+    expect(new Date(envelope.completedAt).toString()).not.toBe("Invalid Date");
+  } finally {
+    await fs.rm(scratchDir, { recursive: true, force: true });
+  }
+});
 
 function isPidAlive(pid: number) {
   try {
@@ -475,6 +508,56 @@ describe("runChildProcess", () => {
 
     expect(await waitForPidExit(descendantPid!, 2_000)).toBe(true);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "kills a bash -lic descendant that escapes the run process group",
+    async () => {
+      let escapedPid: number | null = null;
+
+      try {
+        const escapedCommand = `exec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+          "setInterval(() => {}, 1000)",
+        )}`;
+        const result = await runChildProcess(
+          randomUUID(),
+          process.execPath,
+          [
+            "-e",
+            [
+              "const { spawn } = require('node:child_process');",
+              `const child = spawn('/bin/bash', ['-lic', ${JSON.stringify(escapedCommand)}], { detached: true, stdio: 'ignore' });`,
+              "process.stdout.write(String(child.pid));",
+              "setInterval(() => {}, 1000);",
+            ].join(" "),
+          ],
+          {
+            cwd: process.cwd(),
+            env: {},
+            timeoutSec: 1,
+            graceSec: 1,
+            onLog: async () => {},
+          },
+        );
+
+        escapedPid = Number.parseInt(result.stdout.trim(), 10);
+        expect(result.timedOut).toBe(true);
+        expect(Number.isInteger(escapedPid) && escapedPid > 0).toBe(true);
+        expect(await waitForPidExit(escapedPid!, 2_000)).toBe(true);
+      } finally {
+        if (escapedPid && isPidAlive(escapedPid)) {
+          try {
+            process.kill(-escapedPid, "SIGKILL");
+          } catch {
+            try {
+              process.kill(escapedPid, "SIGKILL");
+            } catch {
+              // Ignore cleanup races.
+            }
+          }
+        }
+      }
+    },
+  );
 
   it.skipIf(process.platform === "win32")(
     "force-kills a child that ignores SIGTERM once the grace window elapses",
@@ -2633,6 +2716,7 @@ describe("buildPaperclipEnv", () => {
   const ENV_KEYS = [
     "PAPERCLIP_API_URL",
     "PAPERCLIP_RUNTIME_API_URL",
+    "PAPERCLIP_RUNTIME_API_CANDIDATES_JSON",
     "PAPERCLIP_LISTEN_HOST",
     "PAPERCLIP_LISTEN_PORT",
     "HOST",
