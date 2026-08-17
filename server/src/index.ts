@@ -9,7 +9,7 @@ import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
 import { and, eq } from "drizzle-orm";
 import {
@@ -95,6 +95,8 @@ import {
 } from "./shutdown.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
+import { canaryWindowService } from "./services/canary-window.js";
+import { serverVersion } from "./version.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -718,6 +720,13 @@ export async function startServer(): Promise<StartedServer> {
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
+  const serverDir = resolve(fileURLToPath(import.meta.url), "..");
+  const canaryWindow = config.heartbeatSchedulerEnabled
+    ? canaryWindowService(db as any, {
+        dataDir: resolve(config.embeddedPostgresDataDir, ".."),
+        repoRoot: resolve(serverDir, ".."),
+      })
+    : null;
   const decisionServiceOptions = {
     wakeOriginAgent: createDecisionWakeOriginAgent(heartbeat?.wakeup ?? null),
   };
@@ -1196,6 +1205,22 @@ export async function startServer(): Promise<StartedServer> {
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
+
+        if (canaryWindow) {
+          const canaryEval = await canaryWindow.evaluateCanaryWindow(serverVersion);
+          if (canaryEval.inCanaryWindow) {
+            logger.info(
+              { ...canaryEval.failure, expiresAt: canaryEval.windowState?.expiresAt },
+              "startup canary observation window is active",
+            );
+          }
+          if (canaryEval.thresholdExceeded) {
+            logger.warn(
+              { ...canaryEval.failure, rollbackTriggered: canaryEval.rollbackTriggered },
+              "startup canary window detected run failure rate spike",
+            );
+          }
+        }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -1408,6 +1433,16 @@ export async function startServer(): Promise<StartedServer> {
               const reviewed = await heartbeat.reconcileProductivityReviews();
               if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
                 logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+              }
+            })
+            .then(async () => {
+              if (!canaryWindow) return;
+              const canaryEval = await canaryWindow.evaluateCanaryWindow(serverVersion);
+              if (canaryEval.thresholdExceeded) {
+                logger.warn(
+                  { ...canaryEval.failure, rollbackTriggered: canaryEval.rollbackTriggered },
+                  "periodic canary window detected run failure rate spike",
+                );
               }
             })
             .catch((err) => {
