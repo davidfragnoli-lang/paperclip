@@ -191,8 +191,7 @@ function monitorFromIssue(issue: IssueLivenessIssueInput) {
   return { policyMonitor, stateMonitor };
 }
 
-export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now: Date | string | number) {
-  const nowMs = typeof now === "number" ? now : readDateMs(now) ?? Date.now();
+function hasScheduledMonitorAt(issue: IssueLivenessIssueInput, nowMs: number) {
   const nextCheckAtMs = readDateMs(issue.monitorNextCheckAt);
   if (nextCheckAtMs === null || nextCheckAtMs <= nowMs) return false;
 
@@ -206,6 +205,29 @@ export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now
   if (maxAttempts !== null && attemptCount >= maxAttempts) return false;
 
   return true;
+}
+
+export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now: Date | string | number) {
+  const nowMs = typeof now === "number" ? now : readDateMs(now) ?? Date.now();
+  return hasScheduledMonitorAt(issue, nowMs);
+}
+
+export function hasScheduledMonitor(issue: IssueLivenessIssueInput, now: Date | string = new Date()) {
+  const nowDate = now instanceof Date ? now : new Date(now);
+  const nowMs = Number.isNaN(nowDate.getTime()) ? Date.now() : nowDate.getTime();
+  return hasScheduledMonitorAt(issue, nowMs);
+}
+
+export function hasExplicitExternalServiceWakeExemption(issue: IssueLivenessIssueInput) {
+  const { policyMonitor, stateMonitor } = monitorFromIssue(issue);
+  const kind = policyMonitor?.kind ?? stateMonitor?.kind;
+  if (kind !== "external_service") return false;
+  const descriptor = policyMonitor?.serviceName ?? stateMonitor?.serviceName ??
+    policyMonitor?.externalRef ?? stateMonitor?.externalRef ?? policyMonitor?.notes ?? stateMonitor?.notes;
+  if (typeof descriptor !== "string" || descriptor.trim().length === 0) return false;
+  const status = typeof stateMonitor?.status === "string" ? stateMonitor.status.toLowerCase() : null;
+  if (status === "triggered" || status === "cleared") return false;
+  return hasScheduledMonitorAt(issue, Date.now());
 }
 
 export function classifyIssueReviewPaths(
