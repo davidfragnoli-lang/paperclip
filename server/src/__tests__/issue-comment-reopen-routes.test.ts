@@ -1244,6 +1244,36 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("allows an agent to cancel a blocked issue whose blocker is unresolved", async () => {
+    const blockedIssue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(blockedIssue);
+    mockIssueService.getByIdForUpdate.mockResolvedValue(blockedIssue);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: blockedIssue.id,
+      blockerIssueIds: ["33333333-3333-4333-8333-333333333333"],
+      unresolvedBlockerIssueIds: ["33333333-3333-4333-8333-333333333333"],
+      unresolvedBlockerCount: 1,
+      allBlockersDone: false,
+      isDependencyReady: false,
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...blockedIssue,
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch(`/api/issues/${blockedIssue.id}`)
+      .send({ status: "cancelled", comment: "Superseded by the active implementation lane." });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      blockedIssue.id,
+      expect.objectContaining({ status: "cancelled" }),
+      expect.anything(),
+    );
+    expect(mockIssueService.getDependencyReadiness).not.toHaveBeenCalled();
+  });
+
   it("does not implicitly reopen a blocked issue via PATCH when the same request wires blockers", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
