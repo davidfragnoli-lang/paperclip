@@ -138,18 +138,26 @@ recycled process when identity cannot be established.
 
 Use `--drain-required` only when the deploy intentionally requires the old terminate-and-retry behavior. Without that flag, the old server verifies that the marker targets its own PID, stops new scheduler work, waits for any queue-claim callback already in flight, snapshots currently running heartbeat run IDs and child PIDs, and skips the shutdown drain so eligible detached local-agent processes can keep running. ACP-backed local runs use server-owned stdio and cannot survive their parent server, so the old server instead persists their complete snapshot, changes the marker to `drainRequired` with `drainReason: "active_acp_run"`, and drains only those runs to queued retries. Detached CLI runs remain eligible for adoption during the same mixed restart. If an ACP process terminates but its terminal run update does not persist, startup classifies it as lost with reason `selective_drain_not_finalized` rather than treating the drain as successful. On startup the new server writes `$PAPERCLIP_HOME/instances/${PAPERCLIP_INSTANCE_ID:-default}/hot-restart-report.json` with `previousServerPid`, `newServerPid`, `previousServerVersion`, `newServerVersion`, `drainReason`, `adoptedRunIds`, `finalizedWhileDownRunIds`, `lostRunIds`, and per-run classifications before the normal orphan reaper runs.
 
+The replacement server cannot recover the old process's stdout/stderr pipe reader for an adopted detached child. Every adopted run therefore records `resultJson.hotRestart.outputCaptureState = "severed"`, an `outputCaptureSeveredAt` watermark, and an `adoptedRunDeadlineAt` fixed 30 minutes after the first adoption. Silence watchdogs treat that state as unavailable capture rather than elapsed silence, and shared-workspace serialization continues to treat the live run as its holder. The periodic orphan reaper terminates and queues one bounded retry for any adopted child still alive at the deadline. Later hot restarts update `adoptedAt` but do not extend the original capture watermark or deadline.
+
 When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eager
 `SIGINT`/`SIGTERM` cleanup hooks. Paperclip owns signal ordering so the heartbeat
 snapshot and any required drain complete while the database is still available;
-the coordinated shutdown path stops embedded PostgreSQL afterward.
+the coordinated shutdown path stops embedded PostgreSQL afterward. If the
+shutdown database query still fails, Paperclip logs the error and writes a
+filesystem-only snapshot of the preflight run set instead of leaving the marker
+without a shutdown snapshot.
 
 The request command records the preflight set of running heartbeat IDs and writes
 an instance-scoped marker plus a PID-targeted legacy home-root handoff marker.
 This lets a previous server version capture its snapshot at the old path while
 the new server correlates that snapshot back to the authoritative instance
 request. If any preflight run ID is absent from the shutdown snapshot, the
-startup report includes it in `lostRunIds`; a missing snapshot therefore cannot
-look like a zero-loss restart.
+replacement server reconstructs that candidate from its fresh database
+connection. A live detached process remains eligible for adoption. A dead or
+server-stdio process is recorded as `server_shutdown_interrupted` and queued for
+retry. Only a failed adoption or failed interruption appears in `lostRunIds`, so
+a missing shutdown-time database connection cannot silently lose every run.
 
 A healthy guarded deploy must compare the report against `/api/health` (`version` or `serverVersion`) and treat any `lostRunIds` entry as a continuity failure that needs recovery before marking deployment complete.
 
@@ -247,6 +255,11 @@ pnpm test
 pnpm test:watch
 ```
 
+Database suites fail closed when embedded PostgreSQL cannot start. Set
+`PAPERCLIP_ALLOW_SKIP_EMBEDDED_POSTGRES=1` only when intentionally running those
+suites on a host that cannot provide embedded PostgreSQL; no other value enables
+the skip behavior.
+
 Browser suites stay separate:
 
 ```sh
@@ -287,6 +300,12 @@ pnpm paperclipai run
 1. auto-onboard if config is missing
 2. `paperclipai doctor` with repair enabled
 3. starts the server when checks pass
+
+When `paperclipai run` starts from a repo checkout and the server import fails with
+`ERR_MODULE_NOT_FOUND` from torn `node_modules`, a broken pnpm store, or stale
+workspace package links, it now attempts a frozen `pnpm install`, reruns the
+workspace-link preflight, verifies `@paperclipai/server` still builds, and then
+retries startup once before surfacing the boot failure.
 
 ## Docker Quickstart (No local Node install)
 
@@ -333,6 +352,14 @@ Every local install keeps runtime state directly under the selected instance roo
   companies/<company-id>/agents/<agent-id>/codex-home/
                                                    # per-agent codex_local home
 ```
+
+The server writes `logs/server.log`. When the live file would exceed 500,000,000
+bytes, the logging transport closes and renames it, immediately reopens
+`server.log`, and compresses the archive as
+`server.log.<UTC timestamp>[.<collision>].gz`. It retains the five newest
+compressed archives. If shutdown interrupts compression, the uncompressed
+archive is recovered on the next server start while the live log remains
+writable.
 
 `PAPERCLIP_HOME` and `PAPERCLIP_INSTANCE_ID` override the home root and instance id respectively. `paperclipai onboard` echoes the resolved values in its banner (`Local home: <home> | instance: <id> | config: <path>`) so you can confirm where state will land before continuing.
 
