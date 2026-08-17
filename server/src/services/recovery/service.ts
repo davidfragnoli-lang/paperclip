@@ -532,7 +532,7 @@ export const INTENTIONALLY_UNCLASSIFIED_ADAPTER_FAILURE_ERROR_CODES: ReadonlySet
 const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your (?:usage limit|(?:session|weekly) limit|monthly spend limit)|usage limit(?: reached| exceeded)?|weekly limit reached|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
 const PROVIDER_QUOTA_RESET_DATE_RE =
-  /\bresets?\s+(?:at\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\.?\s+(\d{1,2})(?:,\s*(\d{4}))?\s+at\s+(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?(?:\s*\(([^)]+)\))?/i;
+  /(?:\bresets?\s+(?:at\s+)?|try again at\s+)(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?(?:\s*\(([^)]+)\))?/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
 
@@ -560,16 +560,17 @@ function parseProviderQuotaClockReset(error: string, now: Date) {
     const minute = Number.parseInt(monthMatch[5] ?? "0", 10);
     const meridiem = (monthMatch[6] ?? "").toLowerCase();
     const timeZone = (monthMatch[7] ?? "").trim();
+    const resolvedTimeZone = timeZone || "UTC";
     if (
       month != null && day >= 1 && day <= 31 && Number.isInteger(year) &&
-      hour12 >= 1 && hour12 <= 12 && minute >= 0 && minute <= 59 && timeZone
+      hour12 >= 1 && hour12 <= 12 && minute >= 0 && minute <= 59
     ) {
       let hour = hour12 % 12;
       if (meridiem === "p") hour += 12;
       try {
         const wallClock = (date: Date) => Object.fromEntries(
           new Intl.DateTimeFormat("en-US", {
-            timeZone,
+            timeZone: resolvedTimeZone,
             hourCycle: "h23",
             year: "numeric",
             month: "2-digit",
@@ -667,6 +668,7 @@ function parseProviderQuotaClockReset(error: string, now: Date) {
 export function classifyAdapterFailureForRecovery(
   latestRun: Pick<NonNullable<LatestIssueRun>, "error" | "errorCode" | "resultJson">,
   now = new Date(),
+  opts?: { consecutiveUnparsedQuotaFailures?: number },
 ): AdapterFailureRecoveryClassification {
   if (!isRecoveryEligibleAdapterFailureErrorCode(latestRun.errorCode)) {
     return null;
@@ -689,9 +691,11 @@ export function classifyAdapterFailureForRecovery(
     return { kind: "provider_quota", retryAt: parsedClockReset, parsedResetTime: true };
   }
   if (latestRun.errorCode === "provider_quota" || PROVIDER_QUOTA_ERROR_RE.test(error)) {
+    const consecutiveFailures = opts?.consecutiveUnparsedQuotaFailures ?? 0;
+    const backoffMultiplier = 2 ** Math.min(consecutiveFailures, 4);
     return {
       kind: "provider_quota",
-      retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
+      retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS * backoffMultiplier),
       parsedResetTime: false,
     };
   }
@@ -1130,6 +1134,45 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
     }
     return { consecutive, latestFinishedAt };
+  }
+
+  async function countConsecutiveUnparsedProviderQuotaRuns(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+  ) {
+    const rows = await db
+      .select({
+        errorCode: heartbeatRuns.errorCode,
+        resultJson: heartbeatRuns.resultJson,
+        status: heartbeatRuns.status,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(10);
+
+    let count = 0;
+    for (const row of rows) {
+      if (
+        !UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
+          row.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
+        )
+      ) {
+        break;
+      }
+      if (row.errorCode !== "provider_quota") break;
+      const result = parseObject(row.resultJson);
+      if (result.providerQuotaRetryNotBefore) break;
+      count += 1;
+    }
+    return count;
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
@@ -4367,9 +4410,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      const adapterFailureClassification = issue.status !== "in_review" && latestRun && isUnsuccessfulTerminalIssueRun(latestRun)
-        ? classifyAdapterFailureForRecovery(latestRun, recoveryNow)
-        : null;
+      const adapterFailureClassificationCandidate = issue.status !== "in_review" && latestRun && isUnsuccessfulTerminalIssueRun(latestRun);
+      let adapterFailureClassification: AdapterFailureRecoveryClassification = null;
+      if (adapterFailureClassificationCandidate && latestRun) {
+        const consecutiveUnparsed = await countConsecutiveUnparsedProviderQuotaRuns(
+          issue.companyId, issue.id, latestRun.agentId,
+        );
+        adapterFailureClassification = classifyAdapterFailureForRecovery(
+          latestRun, recoveryNow, { consecutiveUnparsedQuotaFailures: consecutiveUnparsed },
+        );
+      }
       if (latestRun && adapterFailureClassification) {
         const targetAgentId = getAdapterFailureRecoveryTargetAgentId(issue);
         if (!targetAgentId || latestRun.agentId !== targetAgentId) {
@@ -4572,9 +4622,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        const participantAdapterFailureClassification = isUnsuccessfulTerminalIssueRun(participantLatestRun)
-          ? classifyAdapterFailureForRecovery(participantLatestRun, recoveryNow)
-          : null;
+        let participantAdapterFailureClassification: AdapterFailureRecoveryClassification = null;
+        if (isUnsuccessfulTerminalIssueRun(participantLatestRun) && participantAgentId) {
+          const consecutiveUnparsed = await countConsecutiveUnparsedProviderQuotaRuns(
+            issue.companyId, issue.id, participantAgentId,
+          );
+          participantAdapterFailureClassification = classifyAdapterFailureForRecovery(
+            participantLatestRun, recoveryNow, { consecutiveUnparsedQuotaFailures: consecutiveUnparsed },
+          );
+        }
         if (participantAdapterFailureClassification?.kind === "provider_quota") {
           const monitored = await scheduleProviderQuotaRecoveryMonitor({
             issue,
