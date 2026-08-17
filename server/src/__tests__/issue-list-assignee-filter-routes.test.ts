@@ -614,6 +614,55 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
     expect(second.headers["x-paperclip-request-cache"]).toBe("hit");
   });
 
+  it("does not repopulate the compact issue-list cache from a request invalidated during cleanup", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    let releaseCompute!: () => void;
+    let markComputeStarted!: () => void;
+    const computeStarted = new Promise<void>((resolve) => {
+      markComputeStarted = resolve;
+    });
+    const computeRelease = new Promise<void>((resolve) => {
+      releaseCompute = resolve;
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Invalidated cache issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const app = createApp(companyId, {
+      issueListDiagnostics: {
+        async onComputeStart() {
+          markComputeStarted();
+          await computeRelease;
+        },
+      },
+    });
+    const pendingResponse = request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ view: "compact", limit: "20" });
+
+    const responsePromise = pendingResponse.then((response) => response);
+    await computeStarted;
+    __clearIssueListResponseCacheForTests();
+    releaseCompute();
+    const response = await responsePromise;
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(__getIssueListResponseCacheSizeForTests()).toBe(0);
+  });
+
   it("bounds compact issue-list server cache entries", async () => {
     const companyId = randomUUID();
     const issueId = randomUUID();
