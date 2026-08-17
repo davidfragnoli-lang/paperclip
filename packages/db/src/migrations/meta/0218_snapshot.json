@@ -1,6 +1,6 @@
 {
-  "id": "66cebac9-8e3b-4060-82e4-21b52490e8ab",
-  "prevId": "b4772a1e-5fbb-49df-a5ab-976b7b891ccc",
+  "id": "b4772a1e-5fbb-49df-a5ab-976b7b891ccc",
+  "prevId": "6dee53ad-0e2a-487b-a195-6e245a219e8c",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -21437,28 +21437,14 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
-          "default": "'anyone'"
+          "default": "'board_only'"
         },
         "effective_resolver_policy": {
           "name": "effective_resolver_policy",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
-          "default": "'anyone'"
-        },
-        "resolver_policy_provenance": {
-          "name": "resolver_policy_provenance",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'inherited'"
-        },
-        "effective_resolver_policy_source": {
-          "name": "effective_resolver_policy_source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'requested'"
+          "default": "'board_only'"
         },
         "idempotency_key": {
           "name": "idempotency_key",
