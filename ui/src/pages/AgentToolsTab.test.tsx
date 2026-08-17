@@ -298,12 +298,11 @@ describe("AgentToolsTab", () => {
     expect(installCheckbox).toBeTruthy();
     await act(async () => {
       installCheckbox!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await new Promise((resolve) => window.setTimeout(resolve, 300));
     });
-    await flushReact();
-
-    expect(mockToolsApi.putConnectionInstalls).toHaveBeenCalledWith("conn-1", [
-      { targetType: "agent", targetId: "agent-1" },
-    ]);
+    await vi.waitFor(() =>
+      expect(mockToolsApi.putConnectionInstalls).toHaveBeenCalledWith("conn-1", [
+        { targetType: "agent", targetId: "agent-1" },
+      ]),
+    );
   });
 });
