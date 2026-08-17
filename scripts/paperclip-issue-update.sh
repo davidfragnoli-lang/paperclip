@@ -102,6 +102,19 @@ if [[ -z "${PAPERCLIP_API_URL:-}" || -z "${PAPERCLIP_API_KEY:-}" || -z "${PAPERC
   exit 1
 fi
 
+# A code-payload lane is not complete until its cited payload is on the serving
+# tree. The shared gate treats non-code lanes as no-claim passes, so running it
+# for every `done` transition keeps the close path fail-closed without asking
+# callers to duplicate the gate's payload classifier.
+if [[ "$status" == "done" ]]; then
+  require_command node
+  deploy_gate_path="${PAPERCLIP_DEPLOY_GATE_PATH:-/Users/davidfragnoli/Projects/Fragno Corp/scripts/paperclip-deploy-gate.js}"
+  if ! node "$deploy_gate_path" --issue "$issue_id"; then
+    printf 'Refusing to close %s: deploy gate failed. Land the payload on the serving branch and cite the landing commit.\n' "$issue_id" >&2
+    exit 1
+  fi
+fi
+
 curl -sS -X PATCH \
   "$PAPERCLIP_API_URL/api/issues/$issue_id" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
