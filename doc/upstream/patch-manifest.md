@@ -20,12 +20,12 @@ KPI target: manifest size must trend DOWN.
 
 ## Upstream PR-ready branches (on `fork` remote)
 
-| Branch | Theme | Files | Status | Cycle |
-|--------|-------|-------|--------|-------|
-| `upstream/vitest-exclude-dist` | Test stabilization — vitest config | 6 | PR-ready, not submitted (GATE) | 2026-08-17 |
-| `upstream/fix-install-store-symlink-unlink` | CLI robustness — symlink safety | 2 | PR-ready, not submitted (GATE) | 2026-08-17 |
+| Branch | Theme | Files | Status | PR | Cycle |
+|--------|-------|-------|--------|-----|-------|
+| `fix/vitest-exclude-dist` | Test stabilization — vitest config | 6 | PR submitted | [#11559](https://github.com/paperclipai/paperclip/pull/11559) | 2026-08-17 |
+| `fix/install-store-symlink-unlink` | CLI robustness — symlink safety | 2 | PR submitted | [#11560](https://github.com/paperclipai/paperclip/pull/11560) | 2026-08-17 |
 
-**GATE**: Do NOT submit public PRs to paperclipai/paperclip until David gives standing authorization.
+Standing authorization granted 2026-08-17. Drop local patch after upstream merges.
 
 ---
 
