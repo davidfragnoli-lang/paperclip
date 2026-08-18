@@ -1,8 +1,9 @@
 # Patch Manifest: `fra/live-runtime` vs `origin/master`
 
-Generated: 2026-08-17
-Branch point: `origin/master` at `e71ce9a9d`
-Delta: 236 non-merge commits, 174 files changed (+12,953 / -1,353)
+Generated: 2026-08-18
+Measured against anchor: `e71ce9a9d` on branch `fra/live-runtime` at `9d329b228`
+Delta: 230 non-merge commits, 175 files changed (+13,684 / -1,394)
+Previous measurement: 2026-08-17 — 174 files (same anchor)
 
 ## Summary
 
@@ -10,11 +11,22 @@ Delta: 236 non-merge commits, 174 files changed (+12,953 / -1,353)
 |-------|-------|-------------|
 | **upstreamable** | 98 | Correctness fixes / improvements worth PR-ing |
 | **keep** | 40 | Fragno-specific runtime; documented owner required |
-| **obsolete** | 14 | Upstream has equivalent; drop on rebase |
+| **obsolete** | 19 | Migration renumbering artifacts; require rebase to drop |
 | **externalizable** | 8 | Move to Fragno Corp config/scripts, out of source tree |
-| **Total** | 160 | (14 migration meta snapshots are binary renames counted above) |
+| **Total** | 165 | Unique fork-touched files (some migration files overlap SQL + meta) |
 
 KPI target: manifest size must trend DOWN.
+
+### Measurement log
+
+| Date | Anchor | Branch HEAD | Files | Change | Note |
+|------|--------|-------------|-------|--------|------|
+| 2026-08-17 | `e71ce9a9d` | (manifest creation) | 174 | — | Baseline |
+| 2026-08-18 | `e71ce9a9d` | `9d329b228` | 175 | +1 net | +7 from live fixes, -1 from catalog.json reset (FRA-24563), -5 from commits that were already in the anchor |
+
+### Rebase blocker
+
+The `fra/patches` rebase onto `origin/master` (which would eliminate 19 obsolete migration renumbering files) is blocked by a deep structural conflict in `packages/adapter-utils/src/acpx-engine/execute.ts`: upstream PR #11576 extracted the coordinator lifecycle into separate modules (`run-contracts.js`, `run-resource-ledger.js`, `settlement-sequence.js`, `run-coordinator.js`, `turn-sequence.js`, `run-site-host.js`, `run-site-sandbox.js`) while the fork's stream-idle-timeout patch adds inline timer logic to the same code paths. 7 conflict regions must be resolved with understanding of both architectures. This requires a dedicated rebase pass (see FRA-24563 child issue).
 
 ---
 
