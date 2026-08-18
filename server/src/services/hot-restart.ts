@@ -12,6 +12,7 @@ export const HOT_RESTART_REPORT_FILENAME = "hot-restart-report.json";
 const HOT_RESTART_LOCK_SUFFIX = ".lock";
 const HOT_RESTART_LOCK_STALE_MS = 30_000;
 const HOT_RESTART_LOCK_TIMEOUT_MS = 10_000;
+export const HOT_RESTART_INTENT_STALE_MS = 5 * 60_000;
 
 type ProcessCommandRunner = (command: string, args: string[]) => Promise<string>;
 type ProcessStatReader = (target: string) => Promise<{ ctimeMs: number }>;
@@ -600,16 +601,18 @@ async function claimLegacyHotRestartIntent(filePath: string, intent: HotRestartI
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 
     const existing = await readHotRestartIntentAtPath(filePath).catch(() => null);
-    if (
-      !existing
-      || await isOriginalServerProcessAlive(existing, intent)
-    ) {
-      throw error;
+    if (!existing) throw error;
+
+    if (await isOriginalServerProcessAlive(existing, intent)) {
+      const intentAgeMs = Date.now() - Date.parse(existing.requestedAt);
+      if (
+        !Number.isFinite(intentAgeMs)
+        || intentAgeMs < HOT_RESTART_INTENT_STALE_MS
+      ) {
+        throw error;
+      }
     }
 
-    // An interrupted restart can leave the shared claim behind after its
-    // target server exits. Remove only that exact abandoned request, then
-    // compete normally for a fresh exclusive claim.
     await removeMatchingHotRestartIntent(filePath, existing);
     await writeJsonFileExclusiveAtomic(filePath, intent);
   }

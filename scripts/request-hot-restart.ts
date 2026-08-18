@@ -171,15 +171,30 @@ const { serverPid, drainRequired, processLostProofRunId } = readArgs(process.arg
 const preflightActiveRunIds = drainRequired ? [] : await readPreflightActiveRunIds();
 const processLostProofRunIds = await validateDisposableProcessLostProofRun(processLostProofRunId);
 const previousServerInfo = await readPreviousServerInfo();
-const intent = await writeHotRestartIntent({
-  previousServerPid: serverPid,
-  previousServerIdentity: previousServerInfo.identity,
-  previousServerVersion: previousServerInfo.version,
-  drainRequired,
-  requestedByRunId: process.env.PAPERCLIP_RUN_ID?.trim() || null,
-  preflightActiveRunIds,
-  processLostProofRunIds,
-});
+
+let intent;
+try {
+  intent = await writeHotRestartIntent({
+    previousServerPid: serverPid,
+    previousServerIdentity: previousServerInfo.identity,
+    previousServerVersion: previousServerInfo.version,
+    drainRequired,
+    requestedByRunId: process.env.PAPERCLIP_RUN_ID?.trim() || null,
+    preflightActiveRunIds,
+    processLostProofRunIds,
+  });
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+    console.error(JSON.stringify({
+      status: "hot_restart_intent_blocked",
+      reason: "unconsumed_intent_under_live_server",
+      intentPath: resolveHotRestartIntentPath(),
+      serverPid,
+    }, null, 2));
+    process.exit(10);
+  }
+  throw error;
+}
 
 console.log(JSON.stringify({
   status: "hot_restart_intent_written",

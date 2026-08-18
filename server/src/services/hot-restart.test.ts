@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   findMissingHotRestartSnapshotRunIds,
+  HOT_RESTART_INTENT_STALE_MS,
   isObservedHotRestartTargetAlive,
   readHotRestartIntent,
   readProcessStartedAt,
@@ -304,11 +305,12 @@ describe("hot-restart path compatibility", () => {
 
   it("does not overwrite another instance's active legacy handoff", async () => {
     await withTempHome(async (homeDir) => {
+      const now = new Date();
       process.env.PAPERCLIP_INSTANCE_ID = "blue";
       await writeHotRestartIntent({
         homeDir,
         previousServerPid: process.pid,
-        requestedAt: new Date("2026-08-01T03:40:00.000Z"),
+        requestedAt: now,
         requestedByRunId: "blue-deploy",
       });
 
@@ -317,7 +319,7 @@ describe("hot-restart path compatibility", () => {
         homeDir,
         previousServerPid: 502,
         previousServerStartedAt: "2026-08-01T03:00:00.000Z",
-        requestedAt: new Date("2026-08-01T03:40:01.000Z"),
+        requestedAt: new Date(now.getTime() + 1_000),
         requestedByRunId: "green-deploy",
       })).rejects.toMatchObject({ code: "EEXIST" });
 
@@ -393,7 +395,7 @@ describe("hot-restart path compatibility", () => {
     });
   });
 
-  it("keeps an old handoff while its original target process is alive", async () => {
+  it("keeps a fresh handoff while its original target process is alive", async () => {
     await withTempHome(async (homeDir) => {
       process.env.PAPERCLIP_INSTANCE_ID = "blue";
       await writeHotRestartIntent({
@@ -403,7 +405,7 @@ describe("hot-restart path compatibility", () => {
         requestedByRunId: "blue-deploy",
       });
 
-      vi.useFakeTimers({ now: Date.now() + 10 * 60_000 });
+      vi.useFakeTimers({ now: Date.now() + HOT_RESTART_INTENT_STALE_MS - 1_000 });
       try {
         process.env.PAPERCLIP_INSTANCE_ID = "green";
         await expect(writeHotRestartIntent({
@@ -411,6 +413,30 @@ describe("hot-restart path compatibility", () => {
           previousServerPid: process.pid,
           requestedByRunId: "green-deploy",
         })).rejects.toMatchObject({ code: "EEXIST" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it("reclaims a stale handoff even when the target process is alive", async () => {
+    await withTempHome(async (homeDir) => {
+      process.env.PAPERCLIP_INSTANCE_ID = "blue";
+      await writeHotRestartIntent({
+        homeDir,
+        previousServerPid: process.pid,
+        requestedAt: new Date(),
+        requestedByRunId: "blue-deploy",
+      });
+
+      vi.useFakeTimers({ now: Date.now() + HOT_RESTART_INTENT_STALE_MS + 1_000 });
+      try {
+        process.env.PAPERCLIP_INSTANCE_ID = "green";
+        await expect(writeHotRestartIntent({
+          homeDir,
+          previousServerPid: process.pid,
+          requestedByRunId: "green-deploy",
+        })).resolves.toMatchObject({ requestedByRunId: "green-deploy" });
       } finally {
         vi.useRealTimers();
       }
