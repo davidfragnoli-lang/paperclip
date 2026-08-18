@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-08-11T06:53:04.996Z",
+  "generatedAt": "2026-08-07T20:30:29.973Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
