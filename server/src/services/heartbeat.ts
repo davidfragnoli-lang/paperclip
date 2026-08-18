@@ -226,6 +226,7 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
 } from "./recovery/index.js";
+import { hasExplicitExternalServiceWakeExemption } from "./recovery/issue-graph-liveness.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
@@ -8103,7 +8104,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const monitorState = parseIssueExecutionState(input.issue.executionState)?.monitor ?? null;
     if (!monitorState || monitorState.status !== "triggered") return null;
-    if (monitorState.kind === "external_service") return null;
+    if (hasExplicitExternalServiceWakeExemption(input.issue)) return null;
 
     const currentAttemptCount = Math.max(
       0,
@@ -8142,7 +8143,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!monitorState || monitorState.status !== "triggered") return false;
     if (issue.monitorNextCheckAt) return false;
     if (!["in_progress", "in_review"].includes(issue.status)) return false;
-    if (monitorState.kind === "external_service") return false;
+    if (hasExplicitExternalServiceWakeExemption(issue)) return false;
 
     const patch = rearmUndeliveredIssueMonitorPatch({
       issue,
@@ -8212,7 +8213,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const candidate of candidates) {
       const monitorState = parseIssueExecutionState(candidate.executionState)?.monitor ?? null;
       if (!monitorState || monitorState.status !== "triggered") continue;
-      if (monitorState.kind === "external_service") continue;
+      if (hasExplicitExternalServiceWakeExemption(candidate)) continue;
 
       const [activeRun, pendingInteraction, pendingApproval, dependencyReadiness] = await Promise.all([
         db
@@ -14709,14 +14710,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }))];
     const monitorIssues = monitorIssueIds.length > 0
       ? await db
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          monitorNextCheckAt: issues.monitorNextCheckAt,
-        })
+        .select()
         .from(issues)
         .where(inArray(issues.id, monitorIssueIds))
       : [];
+    const monitorIssueByKey = new Map(
+      monitorIssues.map((issue) => [`${issue.companyId}:${issue.id}`, issue]),
+    );
     const monitorNextCheckAtByIssue = new Map(
       monitorIssues.map((issue) => [
         `${issue.companyId}:${issue.id}`,
@@ -14896,6 +14896,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const runContext = parseObject(run.contextSnapshot);
       const monitorIssueId = readNonEmptyString(runContext.issueId);
+      const monitorIssue = monitorIssueId
+        ? monitorIssueByKey.get(`${run.companyId}:${monitorIssueId}`) ?? null
+        : null;
       const monitorNextCheckAt = monitorIssueId
         ? monitorNextCheckAtByIssue.get(`${run.companyId}:${monitorIssueId}`)
         : undefined;
@@ -14959,6 +14962,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
+
+      if (monitorIssue) {
+        const rearmPatch = await buildTerminalIssueMonitorRearmPatch({
+          issue: monitorIssue,
+          run: finalizedRun,
+          now,
+        });
+        if (rearmPatch) {
+          await db
+            .update(issues)
+            .set({
+              ...rearmPatch,
+              updatedAt: now,
+            })
+            .where(eq(issues.id, monitorIssue.id));
+        }
+      }
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       const retryAgent = await getAgent(run.agentId);
@@ -18590,7 +18610,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .limit(1)
           .then((rows) => rows[0] ?? null);
 
-      const issueHasPersistedMonitor = Boolean(issue.monitorNextCheckAt);
+      const terminalMonitorRearmPatch = await buildTerminalIssueMonitorRearmPatch({
+        issue,
+        run,
+        now: new Date(),
+      });
+      if (terminalMonitorRearmPatch) {
+        await tx
+          .update(issues)
+          .set({
+            ...terminalMonitorRearmPatch,
+            updatedAt: new Date(),
+          })
+          .where(eq(issues.id, issue.id));
+      }
+
+      const issueHasPersistedMonitor = Boolean(
+        issue.monitorNextCheckAt || terminalMonitorRearmPatch,
+      );
       const findExplicitBlockerPath = () =>
         tx
           .select({ id: issueRelations.issueId })

@@ -702,4 +702,224 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_rearmed");
   });
+
+  it("reconciles a stranded external_service monitor when it has triggered status and was self-scheduled", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    const triggeredAt = new Date("2026-04-11T12:00:00.000Z");
+    const tickAt = new Date("2026-04-11T12:10:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "External Svc Bot",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", ""],
+        cwd: process.cwd(),
+      },
+      runtimeConfig: {
+        heartbeat: {
+          enabled: false,
+          wakeOnDemand: true,
+        },
+      },
+      permissions: {},
+    });
+    seededAgentIds.add(agentId);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External service monitor issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          nextCheckAt: triggeredAt.toISOString(),
+          notes: "FRA-22751 setup-log readiness",
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "FRA-22751 setup-log readiness",
+        },
+      },
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          kind: "external_service",
+          nextCheckAt: null,
+          lastTriggeredAt: triggeredAt.toISOString(),
+          attemptCount: 11,
+          notes: "FRA-22751 setup-log readiness",
+          scheduledBy: "assignee",
+          serviceName: "FRA-22751 setup-log readiness",
+          externalRef: null,
+          timeoutAt: null,
+          maxAttempts: 12,
+          recoveryPolicy: null,
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorNextCheckAt: null,
+      monitorAttemptCount: 11,
+      monitorLastTriggeredAt: triggeredAt,
+      monitorNotes: "FRA-22751 setup-log readiness",
+      monitorScheduledBy: "assignee",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.enqueued).toBeGreaterThanOrEqual(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).not.toBeNull();
+    expect(issue.monitorNextCheckAt!.getTime()).toBeGreaterThanOrEqual(tickAt.getTime());
+
+    const state = parseIssueExecutionState(issue.executionState)?.monitor;
+    expect(state?.status).toBe("scheduled");
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_rearmed");
+  });
+
+  it("does not reconcile a genuinely externally-driven external_service monitor at rest", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    const scheduledAt = new Date("2026-04-11T13:00:00.000Z");
+    const tickAt = new Date("2026-04-11T12:10:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "External Svc Bot",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", ""],
+        cwd: process.cwd(),
+      },
+      runtimeConfig: {
+        heartbeat: {
+          enabled: false,
+          wakeOnDemand: true,
+        },
+      },
+      permissions: {},
+    });
+    seededAgentIds.add(agentId);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Genuine external service monitor",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          nextCheckAt: scheduledAt.toISOString(),
+          notes: "Wait for external webhook",
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "External Deploy Webhook",
+        },
+      },
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "scheduled",
+          kind: "external_service",
+          nextCheckAt: scheduledAt.toISOString(),
+          lastTriggeredAt: null,
+          attemptCount: 0,
+          notes: "Wait for external webhook",
+          scheduledBy: "assignee",
+          serviceName: "External Deploy Webhook",
+          externalRef: null,
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: null,
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorNextCheckAt: scheduledAt,
+      monitorAttemptCount: 0,
+      monitorLastTriggeredAt: null,
+      monitorNotes: "Wait for external webhook",
+      monitorScheduledBy: "assignee",
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    const fingerBefore = await heartbeatSideEffectFingerprint();
+    await heartbeat.tickTimers(tickAt);
+    const fingerAfter = await heartbeatSideEffectFingerprint();
+
+    expect(fingerAfter).toBe(fingerBefore);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe(scheduledAt.toISOString());
+  });
 });
