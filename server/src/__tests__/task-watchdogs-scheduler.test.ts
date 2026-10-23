@@ -522,8 +522,6 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     const foreignAgentId = await seedAgent(otherCompanyId);
     const sourceId = await seedIssue(companyId, { status: "done" });
     const childId = await seedIssue(companyId, { parentId: sourceId, status: "done" });
-    // A retained invalid configuration must fail normal assignment validation,
-    // without preventing the valid watchdog in the same sweep from running.
     const broken = await seedWatchdog(companyId, childId, foreignAgentId);
     await seedWatchdog(companyId, sourceId, agentId);
     const { service, wakes } = createService();

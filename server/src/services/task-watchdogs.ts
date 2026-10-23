@@ -1586,8 +1586,6 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     try {
       return await evaluateWatchdog(row, opts);
     } catch (err) {
-      // Keep the configuration active for the next reconciliation. One invalid
-      // watchdog must not prevent other watchdogs or startup recovery from running.
       logger.error({
         err,
         companyId: row.companyId,
